@@ -40,3 +40,10 @@ idempotency_hits = Counter(
     "idempotency_hits_total",
     "Requests deduplicated by idempotency key (no re-delivery)",
 )
+
+# Tier 10A: PEL recovery
+pel_recovered = Counter(
+    "pel_recovered_total",
+    "Messages reclaimed from dead consumers via XAUTOCLAIM, by stream",
+    ["stream"],
+)

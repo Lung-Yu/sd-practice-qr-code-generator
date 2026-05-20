@@ -751,3 +751,74 @@ Send 3 normal + 2 critical:
 - To break 5,000 RPS: Redis cluster + pipeline optimization are the levers
 
 **podman-compose scaling limitation:** `--scale notification-api=N` fails when `ports: "8000:8000"` is set (port conflict). For production, use Kubernetes Deployment with replicas and a Service instead of docker-compose scale.
+
+---
+
+## Tier 10A: PEL Recovery（Dead Consumer Message Reclaim）
+
+**Problem:** Redis Consumer Groups provide at-least-once, not exactly-once delivery. When a worker crashes after XREADGROUP but before XACK, the claimed messages stay in the Pending Entry List (PEL) forever — `XREADGROUP ... >` only delivers NEW messages, not existing PEL entries.
+
+**First evidence:** On system startup after any restart, the workers immediately found and recovered 80 messages from previous test runs that had never been ACKed.
+
+**Fix:** `_recover_pending()` using `XAUTOCLAIM` (Redis 6.2+):
+```python
+next_id, claimed, deleted = await r.xautoclaim(
+    stream, GROUP_NAME, CONSUMER_NAME,
+    min_idle_time=PEL_CLAIM_TIMEOUT_MS,   # 60s >> max delivery time (15s)
+    start_id="0-0",
+    count=BATCH_SIZE,
+)
+```
+Iterates both streams with cursor pagination until `next_id == "0-0"`. Each page of reclaimed messages runs through the same `_process_batch()` path — delivery and ACK are identical to normal flow.
+
+**Demo verified:**
+1. Zombie consumer claimed 1 message, never ACKed
+2. PEL showed: `{message_id: ..., consumer: zombie-DEAD, idle: 37229ms}`
+3. XAUTOCLAIM with `min_idle_time=5000` reclaimed it
+4. PEL after: 0 zombie messages ✓
+
+**Jitter:** each worker's PEL check is staggered by `random.uniform(0, PEL_CHECK_INTERVAL_S)` to avoid all 4 workers sweeping simultaneously. Even if two workers race, XAUTOCLAIM is atomic — only one wins the claim.
+
+**Timeout design rule:** `PEL_CLAIM_TIMEOUT_MS > ATTEMPT_TIMEOUT_S × MAX_RETRIES = 15s`. Default: 60s (4× safety margin). Too short = false positive (re-deliver a message still in flight). Too long = slow recovery from actual crashes.
+
+**At-least-once implication:** if a worker completes `deliver()` then crashes before `XACK`, recovery will re-deliver. For notification systems, duplicate is acceptable. Exactly-once requires idempotent channel receivers or 2-phase commit.
+
+**New metric:** `pel_recovered_total{stream}` — Grafana alert: `rate(pel_recovered_total[5m]) > 100` signals unstable workers.
+
+---
+
+## Tier 10D: Kafka Migration Analysis
+
+**When to migrate:** Redis Streams is not the bottleneck at current scale. Triggers for Kafka:
+
+| Trigger | Threshold |
+|---------|-----------|
+| Sustained throughput | > 100K msg/s |
+| Retention requirement | > 7 days |
+| Multiple independent consumers | > 3 consumer groups |
+| Cross-DC replication | Required |
+| Exactly-once semantics | Business critical |
+
+**Key differences:**
+
+| Feature | Redis Streams | Kafka |
+|---------|--------------|-------|
+| Dead consumer recovery | XAUTOCLAIM (manual, Tier 10A) | Automatic offset replay on restart |
+| Consumer parallelism | Unlimited consumers, complex PEL | Bounded by partition count |
+| Retention | Memory-limited (MAXLEN trim) | Disk-based, near-unlimited |
+| Replay | Limited (XRANGE) | Full (offset reset) |
+| Exactly-once | Needs 2PC or idempotent receiver | Kafka Transactions (adds ~2ms) |
+| Ops complexity | Low | High (broker cluster, rebalancing) |
+
+**Topic design if migrated:**
+```
+notifications.normal   — 16 partitions, 7-day retention, partition key=user_id
+notifications.critical —  8 partitions, 7-day retention
+notifications.dlq      —  4 partitions, 30-day retention
+```
+
+`user_id` as partition key → same user's notifications are ordered + concentrated on one consumer → fewer cross-consumer Redis conflicts. Hotspot risk mitigated via custom partitioner for high-volume users.
+
+**Zero-downtime migration path:** dual-write (Redis Streams + Kafka shadow), validate shadow consumer, cut over, drain Redis PEL, remove Redis Streams writes.
+
+**Core insight:** Redis Streams PEL ≈ Kafka uncommitted offset. Both face the "claim but crash" problem; solutions differ (XAUTOCLAIM vs offset reset). Redis requires self-implementing recovery (Tier 10A); Kafka handles it natively but at the cost of partition-bounded parallelism and operational complexity.

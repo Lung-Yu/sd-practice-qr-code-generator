@@ -19,12 +19,19 @@ Tier 7+ batch fetch: abatch_get() pipelines N HGETALLs → 1 round-trip to prima
 Redis (vs N individual round-trips). Batch XACK collapses N XACKs → 1 command to
 delivery Redis per batch.
 
+Tier 10A: PEL recovery — XAUTOCLAIM reclaims messages from dead consumers.
+When a worker crashes mid-batch, its claimed messages stay in the Pending Entry
+List indefinitely. Every PEL_CHECK_INTERVAL_S seconds each worker scans the PEL
+for messages idle > PEL_CLAIM_TIMEOUT_MS and reprocesses them.
+
 Consumer name = hostname (unique per container in docker-compose).
 """
 import asyncio
+import random
 import signal
 import socket
 import sys
+import time
 
 import redis
 import redis.asyncio as aioredis
@@ -32,6 +39,7 @@ from prometheus_client import start_http_server
 
 from . import config
 from .delivery import deliver
+from .metrics import pel_recovered
 from .queue import GROUP_NAME, STREAM_KEY, STREAM_KEY_CRITICAL
 from .store import store
 
@@ -100,6 +108,47 @@ async def _process_batch(
         await r.xack(stream_key, GROUP_NAME, *msg_ids)
 
 
+async def _recover_pending(
+    r: aioredis.Redis,
+    loop: asyncio.AbstractEventLoop,
+) -> int:
+    """XAUTOCLAIM messages idle > PEL_CLAIM_TIMEOUT_MS from any dead consumer.
+
+    Iterates both streams until next_id returns to '0-0' (no more pending messages
+    older than the timeout). Each page of claimed messages is fed through the normal
+    _process_batch() path so delivery and ACK happen atomically.
+
+    Returns total count of messages recovered across both streams.
+    """
+    total = 0
+    for stream in (STREAM_KEY_CRITICAL, STREAM_KEY):
+        start = "0-0"
+        while True:
+            next_id, claimed, _deleted = await r.xautoclaim(
+                stream,
+                GROUP_NAME,
+                CONSUMER_NAME,
+                min_idle_time=config.PEL_CLAIM_TIMEOUT_MS,
+                start_id=start,
+                count=BATCH_SIZE,
+            )
+            if claimed:
+                print(
+                    f"[worker] PEL recovery: reclaiming {len(claimed)} from {stream}",
+                    flush=True,
+                )
+                await _process_batch(r, claimed, loop, stream_key=stream)
+                pel_recovered.labels(stream=stream).inc(len(claimed))
+                total += len(claimed)
+            # next_id == "0-0" means no pending messages remain past this cursor
+            if next_id == "0-0":
+                break
+            start = next_id
+    if total:
+        print(f"[worker] PEL recovery: {total} messages recovered", flush=True)
+    return total
+
+
 async def run() -> None:
     # Tier 7: XREADGROUP/XACK on delivery Redis; store reads/writes on primary Redis.
     r = aioredis.from_url(config.DELIVERY_REDIS_URL, decode_responses=True, max_connections=20)
@@ -128,13 +177,27 @@ async def run() -> None:
     signal.signal(signal.SIGTERM, _stop)
     signal.signal(signal.SIGINT, _stop)
 
+    # Stagger PEL checks across workers so they don't all sweep simultaneously.
+    # Jitter: uniform(0, PEL_CHECK_INTERVAL_S) so workers spread out their first check.
+    last_pel_check = time.monotonic() - random.uniform(0, config.PEL_CHECK_INTERVAL_S)
+
     print(
         f"[worker] {CONSUMER_NAME} ready — consuming {STREAM_KEY_CRITICAL} (priority) "
-        f"then {STREAM_KEY} / group={GROUP_NAME}",
+        f"then {STREAM_KEY} / group={GROUP_NAME} "
+        f"(PEL recovery every {config.PEL_CHECK_INTERVAL_S}s, timeout={config.PEL_CLAIM_TIMEOUT_MS}ms)",
         flush=True,
     )
 
     while running:
+        # Tier 10A: periodic PEL recovery — reclaim messages from dead consumers.
+        now = time.monotonic()
+        if now - last_pel_check >= config.PEL_CHECK_INTERVAL_S:
+            try:
+                await _recover_pending(r, loop)
+            except Exception as exc:
+                print(f"[worker] PEL recovery error: {exc}", flush=True)
+            last_pel_check = time.monotonic()
+
         # Tier 9C priority: drain critical stream first (non-blocking),
         # then fall back to normal stream (blocking up to BLOCK_MS).
         critical_msgs = await r.xreadgroup(

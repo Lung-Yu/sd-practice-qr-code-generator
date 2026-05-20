@@ -26,3 +26,10 @@ WORKER_BATCH_SIZE = int(os.getenv("WORKER_BATCH_SIZE", "20"))
 # Expired HASHes are filtered out by the `if d` guard in list_for_user / abatch_get.
 # Idempotency keys have their own independent TTL (_IDEMPOTENCY_TTL = 24 h).
 NOTIFICATION_TTL_S = int(os.getenv("NOTIFICATION_TTL_S", str(7 * 24 * 3600)))  # 7 days
+
+# Tier 10A: PEL recovery — reclaim messages from dead consumers.
+# A message sitting in the PEL longer than this is assumed to belong to a dead worker.
+# Must be >> max delivery time (ATTEMPT_TIMEOUT_S * MAX_RETRIES = 15 s by default).
+PEL_CLAIM_TIMEOUT_MS = int(os.getenv("PEL_CLAIM_TIMEOUT_MS", "60000"))   # 60 s
+# How often each worker runs the PEL sweep. Stagger across workers via jitter in code.
+PEL_CHECK_INTERVAL_S = int(os.getenv("PEL_CHECK_INTERVAL_S", "30"))
