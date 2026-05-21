@@ -10,17 +10,31 @@ services:
     volumes:
       - pg_data:/var/lib/postgresql/data
 
-  mcp-server:
+  api:
     build: .
-    image: chatgpt-task-mcp:latest
+    image: chatgpt-task:latest
     env_file:
       - docker-compose.env
     environment:
-      # Override localhost URL — inside the compose network postgres is reachable by service name
       DATABASE_URL: postgresql://${POSTGRES_USER:-taskuser}:${POSTGRES_PASSWORD:-taskpass}@postgres:${POSTGRES_PORT:-5432}/${POSTGRES_DB:-taskdb}
+    ports:
+      - "8000:8000"
+    command: ["python", "-m", "app.api"]
     depends_on:
       - postgres
-    stdin_open: true
+
+  mcp-server:
+    build: .
+    image: chatgpt-task:latest
+    env_file:
+      - docker-compose.env
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-taskuser}:${POSTGRES_PASSWORD:-taskpass}@postgres:${POSTGRES_PORT:-5432}/${POSTGRES_DB:-taskdb}
+    ports:
+      - "8001:8001"
+    command: ["python", "-m", "app.mcp_sse"]
+    depends_on:
+      - postgres
 
 volumes:
   pg_data:

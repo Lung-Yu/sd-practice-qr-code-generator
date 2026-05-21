@@ -7,28 +7,25 @@ SCAFFOLD_DIR="$(dirname "$SCRIPT_DIR")"
 case "${1:-start}" in
   start)
     cd "$SCAFFOLD_DIR"
-    podman-compose build mcp-server
-    podman-compose up -d postgres
-    echo "Postgres running, mcp-server image built."
+    podman-compose build
+    podman-compose up -d postgres api mcp-server
     echo ""
-    echo "Run the MCP server interactively (stdio test):"
-    echo "  ./scripts/start.sh run"
+    echo "Services running:"
+    echo "  REST API  → http://localhost:8000"
+    echo "  MCP (SSE) → http://localhost:8001/sse"
+    echo "  Postgres  → localhost:5432"
     echo ""
-    echo "MCP client config (Claude Desktop / Claude Code):"
-    echo "  command: podman-compose"
-    echo "  args:    [\"-f\", \"$SCAFFOLD_DIR/docker-compose.yml\", \"run\", \"--rm\", \"mcp-server\"]"
-    echo "  cwd:     $SCAFFOLD_DIR"
+    echo "MCP inspector:"
+    echo "  npx @modelcontextprotocol/inspector http://localhost:8001/sse"
+    echo ""
+    echo "Stdio MCP (for PROMPT.md testing):"
+    echo "  podman-compose run --rm -e DATABASE_URL=postgresql://taskuser:taskpass@postgres:5432/taskdb mcp-server python -m app.mcp_server"
     ;;
   stop)
     cd "$SCAFFOLD_DIR"
     podman-compose down
     ;;
-  run)
-    # Runs the MCP server container attached to stdin/stdout — same as an MCP client would
-    cd "$SCAFFOLD_DIR"
-    podman-compose run --rm mcp-server
-    ;;
   *)
-    echo "Usage: $0 [start|stop|run]"
+    echo "Usage: $0 [start|stop]"
     ;;
 esac
