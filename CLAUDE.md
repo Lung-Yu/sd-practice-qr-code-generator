@@ -42,18 +42,27 @@ cd qr_code_generator
 ```bash
 cd chatgpt_task/scaffold
 
-# Start Postgres + build mcp-server image
+# Build images + start all three services (postgres, api, mcp-server)
 ./scripts/start.sh start
 
-# Stop Postgres
+# Stop all services
 ./scripts/start.sh stop
 
-# Run MCP server interactively for stdio testing (hangs on stdin — correct)
-./scripts/start.sh run
+# REST API (FastAPI, :8000)
+curl http://localhost:8000/tasks
+curl -X POST http://localhost:8000/tasks \
+  -H "Content-Type: application/json" \
+  -d '{"description":"...", "scheduled_at":"2025-01-01T00:00:00"}'
+curl http://localhost:8000/tasks/1
+curl -X DELETE http://localhost:8000/tasks/1
 
-# Test with MCP inspector (opens browser at http://localhost:5173)
-npx @modelcontextprotocol/inspector \
-  podman-compose -f "$(pwd)/docker-compose.yml" run --rm mcp-server
+# MCP inspector via SSE (opens browser at http://localhost:5173)
+npx @modelcontextprotocol/inspector http://localhost:8001/sse
+
+# Stdio MCP for PROMPT.md testing (hangs on stdin — correct)
+podman-compose run --rm \
+  -e DATABASE_URL=postgresql://taskuser:taskpass@postgres:5432/taskdb \
+  mcp-server python -m app.mcp_server
 ```
 
 All credentials and config live in `docker-compose.env` — do not hardcode them elsewhere.
@@ -147,37 +156,46 @@ Every exercise follows this pattern:
 
 ### chatgpt_task
 
-Stdio MCP server backed by PostgreSQL + Podman. No HTTP endpoints.
+Three persistent containers (all visible in `podman ps`):
 
 ```
-mcp_server.py (stdio MCP transport)
-    ↓ TOOL_REGISTRY dispatch
-handler functions (sync, receive SQLAlchemy Session)
-    ↓
-scheduler.py (watcher thread scans DB → job_queue → worker thread executes)
-    ↓
-models.py (Job: id, description, status, scheduled_at, time_bucket, result)
-    ↓
-PostgreSQL (via DATABASE_URL from docker-compose.env)
+REST client / curl
+    ↓ HTTP :8000
+api (FastAPI) ── scheduler (watcher + worker threads)
+    ↓                          ↓
+    └──────────────────────────┤
+                               ↓
+                          PostgreSQL :5432
+                               ↑
+mcp_sse.py (SSE MCP :8001) ───┘
+    ↑
+MCP client (Claude Desktop / Claude Code / inspector)
+
+mcp_server.py (stdio — for PROMPT.md / inspector stdio testing)
 ```
+
+**Services** (`scaffold/docker-compose.yml`):
+| Service | Port | Role |
+|---------|------|------|
+| `postgres` | 5432 | Database |
+| `api` | 8000 | FastAPI REST + scheduler (watcher/worker threads) |
+| `mcp-server` | 8001 | SSE MCP server (reuses `TOOL_REGISTRY` from `mcp_server.py`) |
 
 **Infrastructure** (`scaffold/`):
 - `docker-compose.env` — single source of truth for all credentials/config
-- `docker-compose.yml` — two services: `postgres` (always-on) + `mcp-server` (on-demand via `run`)
-- `Dockerfile` — `python:3.11-slim`; `mcp-server` image is built by `start.sh start`
-- `scripts/start.sh` — `start` (build image + start postgres), `stop`, `run` (interactive stdio test)
+- `Dockerfile` — `python:3.11-slim`; one image, `api` and `mcp-server` use different `command`
+- `app/api.py` — FastAPI with `POST/GET/DELETE /tasks`; starts scheduler on lifespan
+- `app/mcp_sse.py` — SSE transport wrapper; imports `server` from `mcp_server.py` so it inherits all registered handlers
+- `app/mcp_server.py` — stdio transport; used directly for PROMPT.md inspector testing
 
-**Why mcp-server doesn't appear in `podman-compose ps`:** it's stdio-based, spawned per-session by the MCP client via `podman-compose run --rm mcp-server`. It's not a persistent background service.
-
-**MCP client config** (Claude Desktop / Claude Code):
+**MCP client config via SSE** (Claude Desktop / Claude Code):
 ```json
 {
-  "command": "podman-compose",
-  "args": ["-f", "/abs/path/scaffold/docker-compose.yml", "run", "--rm", "mcp-server"],
-  "cwd": "/abs/path/scaffold"
+  "url": "http://localhost:8001/sse"
 }
 ```
 
+- **Scheduler ownership**: `api` service runs watcher + worker threads; `mcp-server` container connects to same DB but does not run the scheduler.
 - **Time bucket**: `scheduled_at.strftime("%Y%m%d%H")` stored as partition key; watcher queries `time_bucket <= current_bucket` to catch overdue jobs from past buckets.
 - **Registry pattern**: `TOOL_REGISTRY` maps `"task.create"` → `handle_create_task` etc.; `route_tool_call()` is the single dispatch point. Adding a tool is one registry entry + one handler.
 - **Async bridge**: `call_tool()` is async (MCP requirement) but handlers are sync; bridged via `asyncio.to_thread()`.
