@@ -1,0 +1,26 @@
+version: "3.9"
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    env_file:
+      - docker-compose.env
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+
+  mcp-server:
+    build: .
+    image: chatgpt-task-mcp:latest
+    env_file:
+      - docker-compose.env
+    environment:
+      # Override localhost URL — inside the compose network postgres is reachable by service name
+      DATABASE_URL: postgresql://${POSTGRES_USER:-taskuser}:${POSTGRES_PASSWORD:-taskpass}@postgres:${POSTGRES_PORT:-5432}/${POSTGRES_DB:-taskdb}
+    depends_on:
+      - postgres
+    stdin_open: true
+
+volumes:
+  pg_data:
