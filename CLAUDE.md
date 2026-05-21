@@ -41,14 +41,22 @@ cd qr_code_generator
 ### chatgpt_task
 ```bash
 cd chatgpt_task/scaffold
-pip install -r requirements.txt
 
-# Run MCP server (stdio — hangs waiting for input, which is correct)
-python -m app.mcp_server
+# Start Postgres + build mcp-server image
+./scripts/start.sh start
+
+# Stop Postgres
+./scripts/start.sh stop
+
+# Run MCP server interactively for stdio testing (hangs on stdin — correct)
+./scripts/start.sh run
 
 # Test with MCP inspector (opens browser at http://localhost:5173)
-npx @modelcontextprotocol/inspector python -m app.mcp_server
+npx @modelcontextprotocol/inspector \
+  podman-compose -f "$(pwd)/docker-compose.yml" run --rm mcp-server
 ```
+
+All credentials and config live in `docker-compose.env` — do not hardcode them elsewhere.
 
 ### Adding a new exercise
 ```
@@ -139,22 +147,41 @@ Every exercise follows this pattern:
 
 ### chatgpt_task
 
-Stdio MCP server — no Docker, no HTTP. Uses SQLite (auto-created on first run) + SQLAlchemy.
+Stdio MCP server backed by PostgreSQL + Podman. No HTTP endpoints.
 
 ```
 mcp_server.py (stdio MCP transport)
     ↓ TOOL_REGISTRY dispatch
 handler functions (sync, receive SQLAlchemy Session)
     ↓
-scheduler.py (APScheduler background watcher — scans DB → executes due jobs)
+scheduler.py (watcher thread scans DB → job_queue → worker thread executes)
     ↓
 models.py (Job: id, description, status, scheduled_at, time_bucket, result)
+    ↓
+PostgreSQL (via DATABASE_URL from docker-compose.env)
 ```
 
-- **Time bucket**: `scheduled_at` is rounded to the hour and stored as `time_bucket` for indexed range scans at scale.
+**Infrastructure** (`scaffold/`):
+- `docker-compose.env` — single source of truth for all credentials/config
+- `docker-compose.yml` — two services: `postgres` (always-on) + `mcp-server` (on-demand via `run`)
+- `Dockerfile` — `python:3.11-slim`; `mcp-server` image is built by `start.sh start`
+- `scripts/start.sh` — `start` (build image + start postgres), `stop`, `run` (interactive stdio test)
+
+**Why mcp-server doesn't appear in `podman-compose ps`:** it's stdio-based, spawned per-session by the MCP client via `podman-compose run --rm mcp-server`. It's not a persistent background service.
+
+**MCP client config** (Claude Desktop / Claude Code):
+```json
+{
+  "command": "podman-compose",
+  "args": ["-f", "/abs/path/scaffold/docker-compose.yml", "run", "--rm", "mcp-server"],
+  "cwd": "/abs/path/scaffold"
+}
+```
+
+- **Time bucket**: `scheduled_at.strftime("%Y%m%d%H")` stored as partition key; watcher queries `time_bucket <= current_bucket` to catch overdue jobs from past buckets.
 - **Registry pattern**: `TOOL_REGISTRY` maps `"task.create"` → `handle_create_task` etc.; `route_tool_call()` is the single dispatch point. Adding a tool is one registry entry + one handler.
 - **Async bridge**: `call_tool()` is async (MCP requirement) but handlers are sync; bridged via `asyncio.to_thread()`.
-- **Scaffold TODOs**: `TOOL_REGISTRY` dict and `route_tool_call()` body are left blank for the Guided Track.
+- **Scaffold TODOs** (Guided Track): `get_time_bucket()`, `find_due_jobs()`, `TOOL_REGISTRY` dict, `route_tool_call()` body.
 
 ## Podman Notes
 
