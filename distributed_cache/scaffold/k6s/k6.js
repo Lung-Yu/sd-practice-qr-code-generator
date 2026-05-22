@@ -44,8 +44,8 @@ export const options = {
     },
   },
   thresholds: {
-    http_req_duration: ["p(95)<200"],  // p95 < 200ms
-    http_req_failed:   ["rate<0.05"],  // error rate < 5%
+    http_req_duration: ["p(95)<200"],   // p95 < 200ms
+    cache_error_rate:  ["rate<0.05"],   // actual errors (not 404 cache misses) < 5%
   },
 };
 
