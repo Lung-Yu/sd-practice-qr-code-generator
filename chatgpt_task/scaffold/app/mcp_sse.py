@@ -3,8 +3,7 @@
 Uses FastMCP + Streamable HTTP transport (MCP protocol 2025-11-25) so
 Claude.ai remote connectors can reach it directly.
 
-MCP inspector: npx @modelcontextprotocol/inspector http://localhost:8001/mcp
-Claude.ai connector URL: https://<ngrok-host>/mcp
+Claude.ai connector URL: https://<ngrok-host>/
 """
 
 import uvicorn
@@ -18,7 +17,7 @@ from .mcp_server import (
     handle_list_tasks,
 )
 
-fastmcp = FastMCP("task-scheduler")
+fastmcp = FastMCP("task-scheduler", streamable_http_path="/")
 
 
 def _db():
