@@ -25,3 +25,15 @@ scrape_configs:
     static_configs:
       - targets: ["app1:8000", "app2:8000", "app3:8000", "app4:8000"]
     metrics_path: /metrics
+
+  # distributed_cache — router
+  - job_name: distributed_cache_router
+    static_configs:
+      - targets: ["dc-router:8000"]
+    metrics_path: /metrics
+
+  # distributed_cache — cache nodes
+  - job_name: distributed_cache_nodes
+    static_configs:
+      - targets: ["dc-node1:8001", "dc-node2:8002", "dc-node3:8003"]
+    metrics_path: /metrics

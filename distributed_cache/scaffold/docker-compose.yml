@@ -1,0 +1,79 @@
+version: "3.9"
+
+services:
+  dc-router:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: distributed-cache:latest
+    env_file:
+      - docker-compose.env
+    ports:
+      - "8000:8000"
+    command: ["uvicorn", "app.router_api:app", "--host", "0.0.0.0", "--port", "8000"]
+    depends_on:
+      - dc-node1
+      - dc-node2
+      - dc-node3
+    restart: unless-stopped
+    networks:
+      - default
+      - sd_monitoring
+
+  dc-node1:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: distributed-cache:latest
+    env_file:
+      - docker-compose.env
+    environment:
+      NODE_ID: node1
+      NODE_PORT: "8001"
+    ports:
+      - "8001:8001"
+    command: ["uvicorn", "app.node_api:app", "--host", "0.0.0.0", "--port", "8001"]
+    restart: unless-stopped
+    networks:
+      - default
+      - sd_monitoring
+
+  dc-node2:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: distributed-cache:latest
+    env_file:
+      - docker-compose.env
+    environment:
+      NODE_ID: node2
+      NODE_PORT: "8002"
+    ports:
+      - "8002:8002"
+    command: ["uvicorn", "app.node_api:app", "--host", "0.0.0.0", "--port", "8002"]
+    restart: unless-stopped
+    networks:
+      - default
+      - sd_monitoring
+
+  dc-node3:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: distributed-cache:latest
+    env_file:
+      - docker-compose.env
+    environment:
+      NODE_ID: node3
+      NODE_PORT: "8003"
+    ports:
+      - "8003:8003"
+    command: ["uvicorn", "app.node_api:app", "--host", "0.0.0.0", "--port", "8003"]
+    restart: unless-stopped
+    networks:
+      - default
+      - sd_monitoring
+
+networks:
+  sd_monitoring:
+    external: true
