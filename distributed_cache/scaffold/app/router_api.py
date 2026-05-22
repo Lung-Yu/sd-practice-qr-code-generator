@@ -13,22 +13,18 @@ from app.models import (
 
 # ── configuration ──────────────────────────────────────────────────────
 _raw_urls = os.environ.get("NODE_URLS", "http://dc-node1:8001,http://dc-node2:8002,http://dc-node3:8003")
-NODE_URLS: dict[str, str] = {}  # node_id → base URL  e.g. {"node1": "http://dc-node1:8001"}
+NODE_URLS: dict[str, str] = {}
 
 _strategy_env = os.environ.get("HASH_STRATEGY", "ring").lower()
 _strategy = HashStrategy.RENDEZVOUS if _strategy_env == "rendezvous" else HashStrategy.RING
 _virtual_nodes = int(os.environ.get("VIRTUAL_NODES", "150"))
 
-# Build node_id → url mapping from NODE_URLS.
-# Nodes register themselves: url ends with :<port>, node_id stored in env on the node.
-# Convention: dc-node1:8001 → node_id "node1", dc-node2:8002 → "node2", etc.
 for url in _raw_urls.split(","):
     url = url.strip()
     if not url:
         continue
-    # derive node_id from the hostname part of the URL: http://dc-node1:8001 → "node1"
-    host = url.split("//")[-1].split(":")[0]  # e.g. "dc-node1"
-    node_id = host.replace("dc-", "")  # e.g. "node1"
+    host = url.split("//")[-1].split(":")[0]
+    node_id = host.replace("dc-", "")
     NODE_URLS[node_id] = url
 
 # ── hash ring ──────────────────────────────────────────────────────────
@@ -41,6 +37,10 @@ _requests = Counter("http_requests_total", "HTTP requests", ["handler", "status"
 _route_duration = Histogram("cache_route_duration_seconds", "Time to route + proxy a request")
 
 # ── FastAPI app ────────────────────────────────────────────────────────
+# Sync handlers are intentional: FastAPI runs them in a bounded thread pool
+# (~32 threads), which provides natural back-pressure against the nodes.
+# Async httpx without a semaphore overwhelms node thread pools; the sync
+# thread pool acts as an implicit concurrency limiter.
 app = FastAPI(title="Distributed Cache Router")
 app.mount("/metrics", make_asgi_app())
 
@@ -48,13 +48,8 @@ _client = httpx.Client(timeout=5.0)
 
 
 def _node_url(key: str) -> tuple[str, str]:
-    """Return (node_id, base_url) for the given key."""
     node_id = ring.node_for_key(key)
     return node_id, NODE_URLS[node_id]
-
-
-def _proxy(method: str, url: str, **kwargs) -> httpx.Response:
-    return _client.request(method, url, **kwargs)
 
 
 @app.post("/cache/{key}", response_model=CacheSetResponse)
@@ -62,7 +57,7 @@ def set_key(key: str, body: CacheSetRequest) -> CacheSetResponse:
     node_id, base = _node_url(key)
     with _route_duration.time():
         try:
-            r = _proxy("POST", f"{base}/cache/{key}", json=body.model_dump())
+            r = _client.post(f"{base}/cache/{key}", json=body.model_dump())
             _requests.labels(handler="set", status=str(r.status_code)).inc()
             return CacheSetResponse(**r.json())
         except httpx.RequestError:
@@ -78,7 +73,7 @@ def get_key(key: str):
     node_id, base = _node_url(key)
     with _route_duration.time():
         try:
-            r = _proxy("GET", f"{base}/cache/{key}")
+            r = _client.get(f"{base}/cache/{key}")
             _requests.labels(handler="get", status=str(r.status_code)).inc()
             if r.status_code == 200:
                 return CacheGetResponse(**r.json())
@@ -96,7 +91,7 @@ def delete_key(key: str) -> CacheDeleteResponse:
     node_id, base = _node_url(key)
     with _route_duration.time():
         try:
-            r = _proxy("DELETE", f"{base}/cache/{key}")
+            r = _client.delete(f"{base}/cache/{key}")
             _requests.labels(handler="delete", status=str(r.status_code)).inc()
             return CacheDeleteResponse(**r.json())
         except httpx.RequestError:
@@ -109,14 +104,12 @@ def delete_key(key: str) -> CacheDeleteResponse:
 
 @app.get("/ring/{key}", response_model=RingResponse)
 def ring_inspect(key: str) -> RingResponse:
-    """Return which node owns this key and how many virtual nodes are in the ring."""
     node_id = ring.node_for_key(key)
     return RingResponse(key=key, node=node_id, virtual_nodes=ring.virtual_count)
 
 
 @app.get("/stats", response_model=StatsResponse)
 def get_stats() -> StatsResponse:
-    """Aggregate stats from all nodes."""
     totals: dict[str, int] = {"hits": 0, "misses": 0, "evictions": 0, "size": 0, "capacity": 0}
     for node_id, base in NODE_URLS.items():
         try:
