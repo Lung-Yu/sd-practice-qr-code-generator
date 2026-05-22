@@ -67,6 +67,30 @@ podman-compose run --rm \
 
 All credentials and config live in `docker-compose.env` — do not hardcode them elsewhere.
 
+### distributed_cache
+```bash
+cd distributed_cache/scaffold
+
+./scripts/start.sh start    # router :8000 + dc-node1 :8001 + dc-node2 :8002 + dc-node3 :8003
+./scripts/start.sh rebuild  # rebuild image + start
+./scripts/start.sh stop
+
+# Verify all 9 PROMPT.md checks pass
+./scripts/verify.sh
+
+# Cache API (all via router)
+curl -X POST http://localhost:8000/cache/foo -H 'Content-Type: application/json' -d '{"value":"bar","ttl":60}'
+curl http://localhost:8000/cache/foo
+curl -X DELETE http://localhost:8000/cache/foo
+curl http://localhost:8000/ring/foo    # consistent hash ring inspection
+curl http://localhost:8000/stats       # aggregated hits/misses/evictions across all nodes
+
+# Load test (ramps to 1000 RPS, Prometheus remote write)
+K6_PROMETHEUS_RW_SERVER_URL=http://localhost:9090/api/v1/write \
+K6_PROMETHEUS_RW_TREND_AS_NATIVE_HISTOGRAM=false \
+k6 run -o experimental-prometheus-rw k6s/k6.js
+```
+
 ### Adding a new exercise
 ```
 /new-exercise <topic_name>
@@ -89,8 +113,8 @@ All exercises share a single Prometheus + Grafana instance via the `sd_monitorin
 ```
 docker-compose.monitoring.yml     ← creates sd_monitoring network + Prometheus + Grafana
 monitoring/
-  prometheus.yml                  ← scrapes qr_code app1-4 via sd_monitoring; accepts k6 remote write
-  grafana/dashboards/             ← one JSON per exercise (qr-code-gen, k6-notification)
+  prometheus.yml                  ← scrapes qr_code app1-4, distributed_cache router+nodes; accepts k6 remote write
+  grafana/dashboards/             ← one JSON per exercise (qr-code-gen, k6-notification, distributed-cache)
 ```
 
 Exercise docker-composes reference `sd_monitoring` as an external network. Each `start.sh` auto-creates the network (`podman network create sd_monitoring`) if monitoring isn't running yet, so exercises can start independently.
@@ -200,6 +224,54 @@ mcp_server.py (stdio — for PROMPT.md / inspector stdio testing)
 - **Registry pattern**: `TOOL_REGISTRY` maps `"task.create"` → `handle_create_task` etc.; `route_tool_call()` is the single dispatch point. Adding a tool is one registry entry + one handler.
 - **Async bridge**: `call_tool()` is async (MCP requirement) but handlers are sync; bridged via `asyncio.to_thread()`.
 - **Scaffold TODOs** (Guided Track): `get_time_bucket()`, `find_due_jobs()`, `TOOL_REGISTRY` dict, `route_tool_call()` body.
+
+### distributed_cache
+
+Four containers — one router, three cache nodes:
+
+```
+Client
+  ↓ HTTP :8000
+dc-router (FastAPI)     ← consistent hash ring selects owning node, proxies via httpx
+  ↓ internal network
+dc-node1 :8001   dc-node2 :8002   dc-node3 :8003   (FastAPI, each owns its LRU shard)
+  ↓
+/metrics (Prometheus)   ← scraped by sd_monitoring
+```
+
+**Services** (`scaffold/docker-compose.yml`):
+| Service | Port | Role |
+|---------|------|------|
+| `dc-router` | 8000 | Consistent hash ring, httpx proxy to nodes |
+| `dc-node1` | 8001 | LRU cache shard, Prometheus metrics |
+| `dc-node2` | 8002 | LRU cache shard, Prometheus metrics |
+| `dc-node3` | 8003 | LRU cache shard, Prometheus metrics |
+
+**Infrastructure** (`scaffold/`):
+- `docker-compose.env` — `NODE_URLS`, `HASH_STRATEGY` (ring/rendezvous), `VIRTUAL_NODES`, `CAPACITY`
+- `Dockerfile` — `python:3.11-slim`; single image, `command:` overridden per service
+- `app/hash_ring.py` — `ConsistentHashRing` + `HashStrategy` enum; `add_node`, `get_node`, `rendezvous_node` are guided TODOs
+- `app/lru_cache.py` — `LRUCache` (doubly-linked list + dict + TTL); `get` and `set` are guided TODOs
+- `app/router_api.py` — FastAPI router; uses `hash_ring.node_for_key()`, proxies via `httpx.Client`
+- `app/node_api.py` — FastAPI node; delegates to `LRUCache`, exposes Prometheus counters/gauges labeled by `node`
+- `app/models.py` — Pydantic models for all request/response shapes + RFC 7807 errors
+- `scripts/verify.sh` — 9 curl assertions from PROMPT.md, exits 0 only if all pass
+
+**Key design details**:
+- **Consistent hashing**: 150 virtual nodes per physical node; `bisect_right` wrap-around for ring lookup
+- **Hash strategy toggle**: `HASH_STRATEGY=ring` (default) or `rendezvous`; controlled by env var, no code change needed
+- **LRU data structure**: `_head`/`_tail` sentinel nodes; O(1) get/set/delete via dict + doubly-linked list
+- **TTL**: stored as absolute `expires_at` (Unix timestamp); checked on `get()` — expired keys raise `CacheExpired`, missing keys raise `CacheMiss`
+- **RFC 7807 errors**: `{"error": "miss"|"expired"|"node_unreachable", "key": "...", "node": "..."}` at 404/503
+- **Prometheus metrics**: per-node `cache_hits_total`, `cache_misses_total`, `cache_evictions_total`, `cache_size`, `cache_capacity`; router: `http_requests_total`, `cache_route_duration_seconds`
+- **Grafana dashboard**: `monitoring/grafana/dashboards/distributed-cache.json` (uid `distributed-cache`)
+- **podman-compose note**: `docker-compose.yml` must declare `default: {}` explicitly in the `networks:` block (required by podman-compose 1.5.0)
+- **Scaffold TODOs** (Guided Track): `LRUCache.get()`, `LRUCache.set()`, `HashRing.add_node()`, `HashRing.get_node()`, `HashRing.rendezvous_node()`
+
+**Load test observations** (baseline, 200-key pool, CAPACITY=100/node):
+- p95 latency: ~3ms at 1000 RPS — well under 200ms threshold
+- Hit ratio: ~68% — reasonable for random 200-key access on warm cache
+- Evictions: 0 — 200 keys fit in 300 total capacity; reduce `CAPACITY` to force evictions
 
 ## Podman Notes
 
