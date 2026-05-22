@@ -8,6 +8,7 @@ Claude.ai connector URL: https://<ngrok-host>/
 
 import uvicorn
 from mcp.server.fastmcp import FastMCP
+from mcp.server.transport_security import TransportSecuritySettings
 
 from .database import Base, SessionLocal, engine
 from .mcp_server import (
@@ -17,7 +18,11 @@ from .mcp_server import (
     handle_list_tasks,
 )
 
-fastmcp = FastMCP("task-scheduler", streamable_http_path="/")
+fastmcp = FastMCP(
+    "task-scheduler",
+    streamable_http_path="/",
+    transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),
+)
 
 
 def _db():
