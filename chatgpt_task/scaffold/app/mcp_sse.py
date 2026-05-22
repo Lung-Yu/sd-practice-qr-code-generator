@@ -1,61 +1,78 @@
-"""SSE MCP server for docker-compose deployment (persistent container on :8001).
+"""SSE/Streamable-HTTP MCP server for docker-compose deployment (:8001).
 
-Reuses the same Server instance and TOOL_REGISTRY from mcp_server.py.
-Does NOT start the scheduler — the `api` service owns watcher + worker threads.
+Uses FastMCP + Streamable HTTP transport (MCP protocol 2025-11-25) so
+Claude.ai remote connectors can reach it directly.
 
-MCP inspector: npx @modelcontextprotocol/inspector http://localhost:8001/sse
-
-Claude Desktop / Claude Code config:
-  {
-    "url": "http://localhost:8001/sse",
-    "headers": { "Authorization": "Bearer <MCP_BEARER_TOKEN>" }
-  }
+MCP inspector: npx @modelcontextprotocol/inspector http://localhost:8001/mcp
+Claude.ai connector URL: https://<ngrok-host>/mcp
 """
 
-import os
-
 import uvicorn
-from mcp.server.sse import SseServerTransport
-from starlette.applications import Starlette
-from starlette.requests import Request
-from starlette.responses import Response
-from starlette.routing import Mount, Route
+from mcp.server.fastmcp import FastMCP
 
-from .database import Base, engine
-from .mcp_server import server  # reuses registered list_tools + call_tool handlers
-
-sse_transport = SseServerTransport("/messages/")
-
-_BEARER_TOKEN = os.environ.get("MCP_BEARER_TOKEN", "")
-
-
-def _authorized(request: Request) -> bool:
-    if not _BEARER_TOKEN:
-        return True
-    auth = request.headers.get("Authorization", "")
-    return auth == f"Bearer {_BEARER_TOKEN}"
-
-
-async def handle_sse(request: Request) -> None:
-    if not _authorized(request):
-        return Response("Unauthorized", status_code=401)
-    async with sse_transport.connect_sse(
-        request.scope, request.receive, request._send
-    ) as streams:
-        await server.run(streams[0], streams[1], server.create_initialization_options())
-
-
-starlette_app = Starlette(
-    routes=[
-        Route("/sse", endpoint=handle_sse),
-        Mount("/messages/", app=sse_transport.handle_post_message),
-    ]
+from .database import Base, SessionLocal, engine
+from .mcp_server import (
+    handle_cancel_task,
+    handle_create_task,
+    handle_get_status,
+    handle_list_tasks,
 )
+
+fastmcp = FastMCP("task-scheduler")
+
+
+def _db():
+    db = SessionLocal()
+    try:
+        return db
+    finally:
+        pass  # caller must close
+
+
+@fastmcp.tool()
+def task_create(description: str, scheduled_at: str) -> dict:
+    """Create a scheduled task. scheduled_at must be ISO-8601 (e.g. 2025-01-01T09:00:00)."""
+    db = SessionLocal()
+    try:
+        return handle_create_task(db, description=description, scheduled_at=scheduled_at)
+    finally:
+        db.close()
+
+
+@fastmcp.tool()
+def task_list() -> dict:
+    """List all tasks."""
+    db = SessionLocal()
+    try:
+        return handle_list_tasks(db)
+    finally:
+        db.close()
+
+
+@fastmcp.tool()
+def task_status(job_id: int) -> dict:
+    """Get the status of a task by job_id."""
+    db = SessionLocal()
+    try:
+        return handle_get_status(db, job_id=job_id)
+    finally:
+        db.close()
+
+
+@fastmcp.tool()
+def task_cancel(job_id: int) -> dict:
+    """Cancel a pending task by job_id."""
+    db = SessionLocal()
+    try:
+        return handle_cancel_task(db, job_id=job_id)
+    finally:
+        db.close()
 
 
 def main() -> None:
     Base.metadata.create_all(bind=engine)
-    uvicorn.run(starlette_app, host="0.0.0.0", port=8001)
+    app = fastmcp.streamable_http_app()
+    uvicorn.run(app, host="0.0.0.0", port=8001)
 
 
 if __name__ == "__main__":
