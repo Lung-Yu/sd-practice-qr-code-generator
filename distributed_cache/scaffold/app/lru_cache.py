@@ -90,7 +90,19 @@ class LRUCache:
         6. Compute ttl_remaining = int(node.expires_at - time.time()) if node.expires_at else None
         7. Return (node.value, ttl_remaining)
         """
-        raise NotImplementedError
+        if key not in self._cache:
+            self._misses += 1
+            raise CacheMiss
+        node = self._cache[key]
+        if node.expires_at is not None and time.time() > node.expires_at:
+            self.delete(key)
+            self._misses += 1
+            raise CacheExpired
+        self._remove(node)
+        self._prepend(node)
+        self._hits += 1
+        ttl_remaining = int(node.expires_at - time.time()) if node.expires_at else None
+        return (node.value, ttl_remaining)
 
     def set(self, key: str, value: str, ttl: int | None = None) -> None:
         """
@@ -109,4 +121,17 @@ class LRUCache:
         4. Add to self._cache[key] = node
         5. Call self._prepend(node)
         """
-        raise NotImplementedError
+        if key in self._cache:
+            node = self._cache[key]
+            node.value = value
+            node.expires_at = time.time() + ttl if ttl else None
+            self._remove(node)
+            self._prepend(node)
+            return
+        if len(self._cache) >= self._capacity:
+            lru = self._tail.prev
+            self.delete(lru.key)  # type: ignore[union-attr]
+            self._evictions += 1
+        node = _Node(key=key, value=value, expires_at=time.time() + ttl if ttl else None)
+        self._cache[key] = node
+        self._prepend(node)

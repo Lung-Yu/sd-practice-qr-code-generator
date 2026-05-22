@@ -8,10 +8,10 @@ check() {
   local name="$1"; local expected_status="$2"; local actual_status="$3"; local body="$4"; local grep_pattern="${5:-}"
   if [[ "$actual_status" == "$expected_status" ]] && { [[ -z "$grep_pattern" ]] || echo "$body" | grep -q "$grep_pattern"; }; then
     echo "  ✓ $name"
-    ((PASS++))
+    PASS=$((PASS + 1))
   else
     echo "  ✗ $name (status=$actual_status, body=$body)"
-    ((FAIL++))
+    FAIL=$((FAIL + 1))
   fi
 }
 

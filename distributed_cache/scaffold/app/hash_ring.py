@@ -61,7 +61,11 @@ class HashRing:
           3. Store self._ring_map[h] = node_id
         Also add node_id to self._nodes.
         """
-        raise NotImplementedError
+        for i in range(self.virtual_nodes):
+            h = self._hash(f"{node_id}:{i}")
+            bisect.insort(self._ring, h)
+            self._ring_map[h] = node_id
+        self._nodes.add(node_id)
 
     def get_node(self, key: str) -> str:
         """
@@ -73,7 +77,11 @@ class HashRing:
         3. idx = bisect.bisect_right(self._ring, h) % len(self._ring)
         4. return self._ring_map[self._ring[idx]]
         """
-        raise NotImplementedError
+        if not self._ring:
+            raise ValueError("Hash ring is empty")
+        h = self._hash(key)
+        idx = bisect.bisect_right(self._ring, h) % len(self._ring)
+        return self._ring_map[self._ring[idx]]
 
     def rendezvous_node(self, key: str) -> str:
         """
@@ -84,4 +92,6 @@ class HashRing:
         2. For each node_id in self._nodes, compute score = self._hash(f"{node_id}:{key}")
         3. Return the node_id that has the maximum score
         """
-        raise NotImplementedError
+        if not self._nodes:
+            raise ValueError("No nodes in ring")
+        return max(self._nodes, key=lambda node_id: self._hash(f"{node_id}:{key}"))

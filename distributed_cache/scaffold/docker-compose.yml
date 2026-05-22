@@ -75,5 +75,7 @@ services:
       - sd_monitoring
 
 networks:
+  default: {}
   sd_monitoring:
+    name: sd_monitoring
     external: true
