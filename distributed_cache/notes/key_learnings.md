@@ -502,8 +502,8 @@ Re-seed: nodes used = node1 node2 node3  ← node2 回到輪換
 
 node2 下線後，原本 node2 負責的 ~1/3 key 全部 cache miss。如果 cache miss 需要回 DB，DB 會瞬間承受 3× 的流量（所有這些 key 的請求都直打 DB）。這就是所謂的 **thundering herd**。
 
-緩解方式（這個 exercise 沒實作，但值得知道）：
-- **Circuit breaker on cache miss**：DB 前加限流
+緩解方式：
+- **Circuit breaker**（已實作，見 §15）：node 死後 3 次失敗即快速拒絕，DB 前不再積壓重試
 - **Probabilistic early expiration**（PER）：在 TTL 到期前 stochastic 地 refresh，分散 miss 時機
 - **Replica（寫兩個節點）**：node2 掛掉時從 replica 讀，代價是寫入成本加倍、複雜度上升
 
@@ -519,3 +519,121 @@ Ring 移除 node2 後，那些 key 不是「消失」，而是自動轉移到 ri
 1. 在設計 cache 系統時，要明確選擇 AP 或 CP，並把代價（miss storm vs 部分 503）暴露給上游。
 2. Health check 的偵測窗口（這裡 4s）= interval × threshold，這段時間內 in-flight 請求仍可能 503，是不可避免的 gap。要縮短 gap 就要縮短 interval（成本：更多空請求），或用 passive 偵測（直接捕捉 proxy 的連線錯誤，第一次失敗就移環）。
 3. Node 恢復後 ring 加回，但 node 上的 cache 是空的。如果下游不能承受 miss storm，需要 **warm-up**（重新把 key 搬回去）再讓 router 把流量切回來。
+
+---
+
+## 15. Circuit Breaker：填補 Health Check 的 4 秒偵測窗口
+
+### 問題：Health Checker 有偵測延遲
+
+Health checker 每 2 秒 poll 一次，需要 2 次連續失敗（≈4s）才把節點從 ring 移除。這段空窗期內，proxy 每次都要發起 TCP 連線、等 timeout（5s），大量請求積壓。
+
+```
+t=0    node2 死掉
+t=0~4s 健康檢查還沒觸發，每個 request 都嘗試連 node2
+       → 等 5s timeout → 503 node_unreachable
+t=4s   health checker 把 node2 移出 ring，key 自動 reroute
+```
+
+這段空窗期沒有 back-pressure，如果 cache miss 需要回 DB，這 4 秒會讓 DB 瞬間收到大量重試請求（thundering herd）。
+
+### 解法：Circuit Breaker（三態狀態機）
+
+```
+CLOSED ──(3 次連線失敗)──→ OPEN ──(15s 後)──→ HALF_OPEN ──(成功)──→ CLOSED
+                                                     └──(失敗)──→ OPEN
+```
+
+- **CLOSED**：正常狀態，所有請求通過
+- **OPEN**：快速拒絕，不嘗試 TCP 連線，立即回傳 `{"error":"circuit_open"}` 503
+- **HALF_OPEN**：放行一個試探請求；成功→CLOSED，失敗→回 OPEN
+
+```go
+func (cb *CircuitBreaker) Allow() bool {
+    switch cb.state {
+    case cbClosed:   return true
+    case cbOpen:
+        if time.Since(cb.lastFailure) >= cb.openTimeout {
+            cb.state = cbHalfOpen   // 到期，放一個試探
+            return true
+        }
+        return false                // 快速拒絕
+    case cbHalfOpen: return false   // 試探已在飛行中，其他人等
+    }
+}
+```
+
+### 什麼算「失敗」？什麼不算？
+
+**算失敗**（觸發 RecordFailure）：
+- TCP 連線錯誤（node 死掉 / 網路中斷）
+- HTTP 5xx（node 內部錯誤）
+
+**不算失敗**（觸發 RecordSuccess）：
+- HTTP 200 ok
+- HTTP 404（cache miss）← **這是關鍵**
+
+404 是正常的 cache 行為，不代表節點有問題。如果把 miss 算進失敗，recovery 後的冷 cache 會重新打開 CB，形成死鎖：節點活著但 CB 永遠不 close。
+
+### 測試觀察（`scripts/test_node_failure.sh` Phase 4）
+
+```
+node2 剛被停掉，health checker 尚未觸發（t < 4s）：
+
+req 1: HTTP 503  error=node_unreachable   ← TCP 連線失敗，failures=1
+req 2: HTTP 503  error=node_unreachable   ← failures=2
+req 3: HTTP 503  error=node_unreachable   ← failures=3 → CB OPENS
+req 4: HTTP 503  error=circuit_open       ← 快速拒絕，無 TCP 嘗試
+req 5: HTTP 503  error=circuit_open       ← 同上
+...
+req 10: HTTP 503  error=circuit_open
+
+Summary:
+  503:node_unreachable → 3 times   (真正的連線錯誤)
+  503:circuit_open     → 7 times   (fast-fail，無 TCP 嘗試)
+```
+
+3 次 TCP 失敗後，剩下 7 次全部是 circuit_open（每次 < 1ms，不再等 timeout）。Health checker 6 秒後把 node2 移出 ring，之後 key 自動 reroute，所有 30 個 key 正常服務（hits=30, errors=0）。
+
+### CB vs Health Checker 的分工
+
+| 機制 | 類型 | 觸發時機 | 作用 |
+|------|------|---------|------|
+| **Health Checker** | Proactive（主動 poll） | 每 2s 固定觸發 | 修改 ring：決定流量路由給誰 |
+| **Circuit Breaker** | Reactive（被動偵測） | 第 3 次請求失敗後立即觸發 | 阻止後續請求去嘗試已知壞節點 |
+
+兩者互補：CB 在 health checker 還沒動作的 4s 空窗內提供 fast-fail；health checker 修完 ring 後，CB 的 fast-fail 就消失（key 不再路由到 node2），CB 本身也由 health checker 在 recovery 時 Reset。
+
+### Recovery 流程
+
+```
+node2 重啟 → health checker 成功 ping 到 /health
+  → ring.addNode("node2")    ← 流量重新路由給 node2
+  → cb.Reset()               ← CB 強制回 CLOSED，不等 openTimeout
+
+這樣避免了：node2 已經健康，但 CB 還在 OPEN，新流量
+仍被拒絕 15s 的問題。
+```
+
+### Prometheus 監控
+
+```go
+circuitOpenTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+    Name: "cache_circuit_open_total",
+    Help: "Requests rejected because the node's circuit breaker is open",
+}, []string{"node"})
+```
+
+PromQL 查看各節點 circuit open 速率：
+```promql
+rate(cache_circuit_open_total[1m])
+```
+
+spike 代表某節點正在故障；spike 消失代表 health checker 已移除或 CB 自然恢復。
+
+### 帶走的原則
+
+1. **Circuit breaker 補 health check 的盲區**：health check 是秒級的，CB 是毫秒級的。兩者結合才能把故障的影響時間從「秒」壓到「3 個請求」。
+2. **404 ≠ 失敗**：cache miss 是正常業務行為，不能算進 CB 失敗計數。設計 CB 時要明確定義「什麼是失敗」，而不是「所有非 200」。
+3. **CB 與 ring 的生命週期要連動**：recovery 時要同時 `ring.addNode` + `cb.Reset()`，否則流量切回來但 CB 還開著，保護機制變成阻塞。
+4. **HALF_OPEN 的「一個試探」語意**：只放行一個請求，其他人繼續 fast-fail，直到那個試探有結果。這確保 recovery 是漸進的，不是「timeout 到了全部湧進來」的二次衝擊。
