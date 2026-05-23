@@ -415,10 +415,10 @@ wg.Wait()
 ```
 Client
   ↓
-Router (Consistent Hash Ring)
-  ↓         ↓         ↓
-Node 1    Node 2    Node 3
-(LRU+TTL)(LRU+TTL)(LRU+TTL)
+Router (Consistent Hash Ring + Write-Through)
+  ↓         ↓         ↓              ↓
+Node 1    Node 2    Node 3        go_store
+(LRU+TTL)(LRU+TTL)(LRU+TTL)    (backing DB)
   ↓
 /metrics → Prometheus → Grafana
 ```
@@ -432,6 +432,7 @@ Node 1    Node 2    Node 3
 | 節點 | 怎麼做 LRU？ | dict + doubly-linked list | 全部操作 O(1) |
 | 節點 | TTL 如何存？ | 絕對 timestamp (`expires_at`) | 精確，計算 ttl_remaining 方便 |
 | 節點 | miss vs expired 如何區分？ | 兩個不同的 Exception class | 讓 caller 能各自處理語意 |
+| 持久化 | Cache 重啟後資料怎麼辦？ | Write-through (parallel/store_first/cache_first) | 根據「失敗時信任哪一邊」選模式 |
 | 錯誤 | HTTP error format？ | RFC 7807 簡化版 `{error, key, node}` | 統一格式，client 好解析 |
 | 監控 | 如何看各節點差異？ | Prometheus label `node=node{1,2,3}` | `sum by (node)` 找熱點 |
 
@@ -457,6 +458,14 @@ Node 1    Node 2    Node 3
 - 短期：`--workers N`（多進程，打破 Python 單進程 GIL 天花板）→ ~1,823 RPS
 - 中期：Go router + Go nodes（移除解釋器開銷，goroutine 無 GIL）→ ~10,000 RPS
 - 長期：節點水平擴展（多個 replica）→ 理論上線性擴展
+
+**Write-Through 模式的一致性取捨**：
+
+| 模式 | 寫入可用性 | 資料持久性 | 適用場景 |
+|------|-----------|-----------|---------|
+| `parallel` | 最低（兩邊都要通） | 最強 | 不容許任何丟失 |
+| `store_first` | 中（store 掛才失敗） | 強（DB 優先） | DB 是 source of truth |
+| `cache_first` | 中（cache 掛才失敗） | 弱（store 可能落後） | 讀多寫少，可最終一致 |
 
 ---
 
