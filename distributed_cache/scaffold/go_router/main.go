@@ -52,6 +52,11 @@ var (
 	}
 )
 
+var (
+	storeURL         string // empty → write-through disabled
+	writeThroughMode string // "parallel" | "store_first" | "cache_first"
+)
+
 type nodeHealthState struct {
 	Alive    bool `json:"alive"`
 	Failures int  `json:"failures"`
@@ -118,6 +123,21 @@ func callNode(ctx context.Context, nodeID, method, targetURL string, body []byte
 	} else {
 		cb.RecordSuccess()
 	}
+	return nodeResult{status: resp.StatusCode, body: respBody, headers: resp.Header.Clone()}
+}
+
+// callStore sends one request to the backing store and returns the result.
+// No circuit breaker — store failure surfaces directly as node_unreachable.
+func callStore(ctx context.Context, method, key string, body []byte) nodeResult {
+	req, _ := http.NewRequestWithContext(ctx, method, storeURL+"/store/"+key, bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.ContentLength = int64(len(body))
+	resp, err := proxyClient.Do(req)
+	if err != nil {
+		return nodeResult{errMsg: "node_unreachable"}
+	}
+	defer resp.Body.Close()
+	respBody, _ := io.ReadAll(resp.Body)
 	return nodeResult{status: resp.StatusCode, body: respBody, headers: resp.Header.Clone()}
 }
 
@@ -365,7 +385,22 @@ func handleHealth(w http.ResponseWriter, r *http.Request) {
 	if degraded {
 		status = "degraded"
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"status": status, "nodes": nodes})
+	out := map[string]any{"status": status, "nodes": nodes}
+	if storeURL != "" {
+		storeAlive := false
+		resp, err := proxyClient.Get(storeURL + "/health")
+		if err == nil && resp.StatusCode == http.StatusOK {
+			storeAlive = true
+		}
+		if resp != nil {
+			resp.Body.Close()
+		}
+		out["store"] = map[string]any{
+			"alive":              storeAlive,
+			"write_through_mode": writeThroughMode,
+		}
+	}
+	writeJSON(w, http.StatusOK, out)
 }
 
 // ── health checker ────────────────────────────────────────────────────────────
@@ -439,6 +474,8 @@ func main() {
 	stratEnv := getEnv("HASH_STRATEGY", "ring")
 	virtualNodes, _ := strconv.Atoi(getEnv("VIRTUAL_NODES", "150"))
 	port := getEnv("ROUTER_PORT", "8000")
+	storeURL = getEnv("STORE_URL", "")
+	writeThroughMode = getEnv("WRITE_THROUGH_MODE", "parallel")
 
 	strat := strategyRing
 	if stratEnv == "rendezvous" {
@@ -493,7 +530,7 @@ func main() {
 	mux.HandleFunc("GET /health", handleHealth)
 	mux.Handle("GET /metrics", promhttp.Handler())
 
-	log.Printf("Go router starting on :%s (nodes=%d, strategy=%s, vnodes=%d)",
-		port, len(nodeURLs), stratEnv, virtualNodes)
+	log.Printf("Go router starting on :%s (nodes=%d, strategy=%s, vnodes=%d, store=%q, wt_mode=%s)",
+		port, len(nodeURLs), stratEnv, virtualNodes, storeURL, writeThroughMode)
 	log.Fatal(http.ListenAndServe(":"+port, mux))
 }
