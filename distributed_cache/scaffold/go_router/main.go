@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bytes"
+	"context"
 	"encoding/json"
 	"io"
 	"log"
@@ -71,6 +73,16 @@ type statsResp struct {
 	Capacity  int64 `json:"capacity"`
 }
 
+// nodeResult holds the outcome of a single proxied call to a cache node.
+// errMsg is non-empty when the request never reached the node (circuit_open
+// or node_unreachable); status/body/headers are populated on a real HTTP response.
+type nodeResult struct {
+	status  int
+	body    []byte
+	headers http.Header
+	errMsg  string // "circuit_open" | "node_unreachable" | ""
+}
+
 // ── helpers ───────────────────────────────────────────────────────────────────
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
@@ -89,17 +101,52 @@ func nodeFor(w http.ResponseWriter, key string) (nodeID, base string, ok bool) {
 	return id, nodeURLs[id], true
 }
 
-// proxy forwards a request to a node, guarded by that node's circuit breaker.
-//
-// Failure accounting:
-//   - TCP/timeout error  → RecordFailure (node unreachable)
-//   - HTTP 5xx           → RecordFailure (node misbehaving)
-//   - HTTP 2xx / 4xx     → RecordSuccess (normal responses, 404 = cache miss ≠ failure)
-func proxy(w http.ResponseWriter, r *http.Request, nodeID, targetURL, handler string) {
+// callNode executes one proxied HTTP request to a node and returns the result.
+// It manages the circuit breaker: records failure on TCP error or 5xx, success otherwise.
+// 404 (cache miss) is a success — it is normal cache behaviour.
+func callNode(ctx context.Context, nodeID, method, targetURL string, body []byte, header http.Header) nodeResult {
 	cb := circuitBreakers[nodeID]
-
 	if !cb.Allow() {
 		circuitOpenTotal.WithLabelValues(nodeID).Inc()
+		return nodeResult{errMsg: "circuit_open"}
+	}
+	start := time.Now()
+	req, _ := http.NewRequestWithContext(ctx, method, targetURL, bytes.NewReader(body))
+	req.Header = header.Clone()
+	req.ContentLength = int64(len(body))
+	resp, err := proxyClient.Do(req)
+	routeDuration.Observe(time.Since(start).Seconds())
+	if err != nil {
+		cb.RecordFailure()
+		return nodeResult{errMsg: "node_unreachable"}
+	}
+	defer resp.Body.Close()
+	respBody, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode >= 500 {
+		cb.RecordFailure()
+	} else {
+		cb.RecordSuccess()
+	}
+	return nodeResult{status: resp.StatusCode, body: respBody, headers: resp.Header.Clone()}
+}
+
+// writeResult writes a nodeResult to w, copying status, headers, and body.
+func writeResult(w http.ResponseWriter, res nodeResult) {
+	for k, vs := range res.headers {
+		for _, v := range vs {
+			w.Header().Add(k, v)
+		}
+	}
+	w.WriteHeader(res.status)
+	w.Write(res.body) //nolint:errcheck
+}
+
+// proxy forwards a single request to one node, writing the response to w.
+// Used for handlers that do not need replication (e.g. /stats, /ring).
+func proxy(w http.ResponseWriter, r *http.Request, nodeID, targetURL, handler string) {
+	body, _ := io.ReadAll(r.Body)
+	res := callNode(r.Context(), nodeID, r.Method, targetURL, body, r.Header)
+	if res.errMsg == "circuit_open" {
 		requestsTotal.WithLabelValues(handler, "503").Inc()
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{
 			"error": "circuit_open",
@@ -107,38 +154,14 @@ func proxy(w http.ResponseWriter, r *http.Request, nodeID, targetURL, handler st
 		})
 		return
 	}
-
-	start := time.Now()
-	req, _ := http.NewRequestWithContext(r.Context(), r.Method, targetURL, r.Body)
-	req.Header = r.Header.Clone()
-	req.ContentLength = r.ContentLength
-
-	resp, err := proxyClient.Do(req)
-	routeDuration.Observe(time.Since(start).Seconds())
-
-	if err != nil {
-		cb.RecordFailure()
+	if res.errMsg == "node_unreachable" {
 		requestsTotal.WithLabelValues(handler, "503").Inc()
 		writeJSON(w, http.StatusServiceUnavailable,
 			map[string]string{"error": "node_unreachable", "node": nodeID})
 		return
 	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode >= 500 {
-		cb.RecordFailure()
-	} else {
-		cb.RecordSuccess() // includes 404 cache miss — that is normal
-	}
-
-	requestsTotal.WithLabelValues(handler, strconv.Itoa(resp.StatusCode)).Inc()
-	for k, vs := range resp.Header {
-		for _, v := range vs {
-			w.Header().Add(k, v)
-		}
-	}
-	w.WriteHeader(resp.StatusCode)
-	io.Copy(w, resp.Body)
+	requestsTotal.WithLabelValues(handler, strconv.Itoa(res.status)).Inc()
+	writeResult(w, res)
 }
 
 // ── route handlers ────────────────────────────────────────────────────────────
