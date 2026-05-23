@@ -3,6 +3,7 @@ package main
 import (
 	"container/list"
 	"encoding/json"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -45,7 +46,7 @@ func newLocalCache(strategy string, capacity int, rebuildInterval time.Duration,
 	case "lfu":
 		return newLFUCache(capacity)
 	case "periodic":
-		return &noopCache{} // implemented in Task 4
+		return newPeriodicCache(capacity, rebuildInterval, fetchFn)
 	default: // "counter"
 		return newCounterCache(capacity)
 	}
@@ -324,5 +325,132 @@ func (c *lfuCache) Stats() LocalCacheStats {
 		Size:     size,
 		Capacity: c.capacity,
 		Strategy: "lfu",
+	}
+}
+
+// ── periodic strategy — async batch recompute ─────────────────────────────────
+
+type periodicEntry struct {
+	value     []byte
+	expiresAt time.Time
+}
+
+type periodicCache struct {
+	counters sync.Map               // key → *atomic.Uint64 (lock-free hit counting)
+	snapMu   sync.RWMutex
+	snapshot map[string]periodicEntry
+	capacity int
+	interval time.Duration
+	fetchFn  func(key string) ([]byte, bool)
+	hits     int64
+	misses   int64
+	done     chan struct{}
+}
+
+func newPeriodicCache(capacity int, interval time.Duration, fetchFn func(string) ([]byte, bool)) *periodicCache {
+	c := &periodicCache{
+		snapshot: make(map[string]periodicEntry),
+		capacity: capacity,
+		interval: interval,
+		fetchFn:  fetchFn,
+		done:     make(chan struct{}),
+	}
+	go c.rebuildLoop()
+	return c
+}
+
+func (c *periodicCache) rebuildLoop() {
+	ticker := time.NewTicker(c.interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			c.doRebuild()
+		case <-c.done:
+			return
+		}
+	}
+}
+
+func (c *periodicCache) doRebuild() {
+	type kc struct {
+		key   string
+		count uint64
+	}
+	var pairs []kc
+	c.counters.Range(func(k, v any) bool {
+		pairs = append(pairs, kc{key: k.(string), count: v.(*atomic.Uint64).Load()})
+		return true
+	})
+	sort.Slice(pairs, func(i, j int) bool { return pairs[i].count > pairs[j].count })
+	if len(pairs) > c.capacity {
+		pairs = pairs[:c.capacity]
+	}
+
+	c.snapMu.RLock()
+	oldSnap := c.snapshot
+	c.snapMu.RUnlock()
+
+	newSnap := make(map[string]periodicEntry, len(pairs))
+	for _, p := range pairs {
+		if e, ok := oldSnap[p.key]; ok {
+			newSnap[p.key] = e // keep existing cached value
+		} else if val, ok2 := c.fetchFn(p.key); ok2 {
+			ttl := parseTTL(val)
+			var expiresAt time.Time
+			if ttl > 0 {
+				expiresAt = time.Now().Add(time.Duration(ttl) * time.Second)
+			}
+			newSnap[p.key] = periodicEntry{value: val, expiresAt: expiresAt}
+		}
+	}
+
+	c.snapMu.Lock()
+	c.snapshot = newSnap
+	c.snapMu.Unlock()
+}
+
+func (c *periodicCache) Get(key string) ([]byte, bool) {
+	c.snapMu.RLock()
+	e, ok := c.snapshot[key]
+	c.snapMu.RUnlock()
+
+	if !ok {
+		atomic.AddInt64(&c.misses, 1)
+		return nil, false
+	}
+	if !e.expiresAt.IsZero() && time.Now().After(e.expiresAt) {
+		c.snapMu.Lock()
+		delete(c.snapshot, key)
+		c.snapMu.Unlock()
+		atomic.AddInt64(&c.misses, 1)
+		return nil, false
+	}
+	atomic.AddInt64(&c.hits, 1)
+	return e.value, true
+}
+
+func (c *periodicCache) RecordHit(key string, _ []byte) {
+	v, _ := c.counters.LoadOrStore(key, new(atomic.Uint64))
+	v.(*atomic.Uint64).Add(1)
+}
+
+func (c *periodicCache) Invalidate(key string) {
+	c.snapMu.Lock()
+	delete(c.snapshot, key)
+	c.snapMu.Unlock()
+	c.counters.Delete(key)
+}
+
+func (c *periodicCache) Stats() LocalCacheStats {
+	c.snapMu.RLock()
+	size := len(c.snapshot)
+	c.snapMu.RUnlock()
+	return LocalCacheStats{
+		Hits:     atomic.LoadInt64(&c.hits),
+		Misses:   atomic.LoadInt64(&c.misses),
+		Size:     size,
+		Capacity: c.capacity,
+		Strategy: "periodic",
 	}
 }

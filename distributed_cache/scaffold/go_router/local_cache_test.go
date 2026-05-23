@@ -182,3 +182,66 @@ func TestLFUCacheTTLExpiry(t *testing.T) {
 		t.Fatal("expected miss after TTL expiry")
 	}
 }
+
+// ── periodicCache ─────────────────────────────────────────────────────────────
+
+func TestPeriodicCacheMissOnEmpty(t *testing.T) {
+	fetchFn := func(key string) ([]byte, bool) { return makeVal("v", 0), true }
+	c := newPeriodicCache(5, 1*time.Hour, fetchFn)
+	if _, ok := c.Get("missing"); ok {
+		t.Fatal("expected miss on empty snapshot")
+	}
+}
+
+func TestPeriodicCacheRebuildPromotesTopK(t *testing.T) {
+	fetchFn := func(key string) ([]byte, bool) {
+		return makeVal(key+"_val", 0), true
+	}
+	c := newPeriodicCache(2, 1*time.Hour, fetchFn) // long interval; call doRebuild manually
+	v := makeVal("v", 0)
+	for i := 0; i < 10; i++ { c.RecordHit("key1", v) }
+	for i := 0; i < 5; i++ { c.RecordHit("key2", v) }
+	c.RecordHit("key3", v) // count=1, rank 3
+
+	c.doRebuild()
+
+	if _, ok := c.Get("key1"); !ok {
+		t.Fatal("key1 (rank 1) should be in L1 after rebuild")
+	}
+	if _, ok := c.Get("key2"); !ok {
+		t.Fatal("key2 (rank 2) should be in L1 after rebuild")
+	}
+	if _, ok := c.Get("key3"); ok {
+		t.Fatal("key3 (rank 3) must not be in L1 with capacity=2")
+	}
+}
+
+func TestPeriodicCacheInvalidate(t *testing.T) {
+	fetchFn := func(key string) ([]byte, bool) { return makeVal("v", 0), true }
+	c := newPeriodicCache(5, 1*time.Hour, fetchFn)
+	v := makeVal("v", 0)
+	for i := 0; i < 3; i++ { c.RecordHit("k", v) }
+	c.doRebuild()
+	if _, ok := c.Get("k"); !ok {
+		t.Fatal("expected hit after rebuild")
+	}
+	c.Invalidate("k")
+	if _, ok := c.Get("k"); ok {
+		t.Fatal("expected miss after invalidate")
+	}
+}
+
+func TestPeriodicCacheTTLExpiry(t *testing.T) {
+	fetchFn := func(key string) ([]byte, bool) { return makeVal("v", 1), true } // ttl=1s
+	c := newPeriodicCache(5, 1*time.Hour, fetchFn)
+	v := makeVal("v", 1)
+	for i := 0; i < 3; i++ { c.RecordHit("k", v) }
+	c.doRebuild() // snapshot gets entry with expiresAt = now+1s
+	if _, ok := c.Get("k"); !ok {
+		t.Fatal("expected hit immediately after rebuild")
+	}
+	time.Sleep(1100 * time.Millisecond)
+	if _, ok := c.Get("k"); ok {
+		t.Fatal("expected miss after TTL expiry")
+	}
+}
