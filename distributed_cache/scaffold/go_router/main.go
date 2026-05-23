@@ -92,16 +92,6 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	json.NewEncoder(w).Encode(v)
 }
 
-func nodeFor(w http.ResponseWriter, key string) (nodeID, base string, ok bool) {
-	id, found := ring.nodeForKey(key)
-	if !found {
-		writeJSON(w, http.StatusServiceUnavailable,
-			map[string]string{"error": "no_nodes_available"})
-		return "", "", false
-	}
-	return id, nodeURLs[id], true
-}
-
 // callNode executes one proxied HTTP request to a node and returns the result.
 // It manages the circuit breaker: records failure on TCP error or 5xx, success otherwise.
 // 404 (cache miss) is a success — it is normal cache behaviour.
