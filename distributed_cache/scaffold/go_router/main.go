@@ -61,7 +61,8 @@ type nodeHealthState struct {
 
 type ringResp struct {
 	Key          string `json:"key"`
-	Node         string `json:"node"`
+	Node         string `json:"node"`    // primary (kept for backward compat)
+	Replica      string `json:"replica"` // replica node; empty if only one node in ring
 	VirtualNodes int    `json:"virtual_nodes"`
 }
 
@@ -221,11 +222,27 @@ func handleSet(w http.ResponseWriter, r *http.Request) {
 
 func handleGet(w http.ResponseWriter, r *http.Request) {
 	key := r.PathValue("key")
-	nodeID, base, ok := nodeFor(w, key)
-	if !ok {
+	nodes := ring.nodesForKey(key, 2)
+	if len(nodes) == 0 {
+		requestsTotal.WithLabelValues("get", "503").Inc()
+		writeJSON(w, http.StatusServiceUnavailable,
+			map[string]string{"error": "no_nodes_available"})
 		return
 	}
-	proxy(w, r, nodeID, base+"/cache/"+key, "get")
+	for _, nodeID := range nodes {
+		res := callNode(r.Context(), nodeID, "GET",
+			nodeURLs[nodeID]+"/cache/"+key, nil, r.Header)
+		if res.errMsg != "" {
+			continue // try replica
+		}
+		requestsTotal.WithLabelValues("get", strconv.Itoa(res.status)).Inc()
+		writeResult(w, res)
+		return
+	}
+	// All nodes in the replication set are unreachable
+	requestsTotal.WithLabelValues("get", "503").Inc()
+	writeJSON(w, http.StatusServiceUnavailable,
+		map[string]string{"error": "no_nodes_available"})
 }
 
 func handleDelete(w http.ResponseWriter, r *http.Request) {
@@ -281,13 +298,20 @@ func handleDelete(w http.ResponseWriter, r *http.Request) {
 
 func handleRing(w http.ResponseWriter, r *http.Request) {
 	key := r.PathValue("key")
-	nodeID, _, ok := nodeFor(w, key)
-	if !ok {
+	nodes := ring.nodesForKey(key, 2)
+	if len(nodes) == 0 {
+		writeJSON(w, http.StatusServiceUnavailable,
+			map[string]string{"error": "no_nodes_available"})
 		return
+	}
+	replica := ""
+	if len(nodes) > 1 {
+		replica = nodes[1]
 	}
 	writeJSON(w, http.StatusOK, ringResp{
 		Key:          key,
-		Node:         nodeID,
+		Node:         nodes[0],
+		Replica:      replica,
 		VirtualNodes: ring.virtualCount(),
 	})
 }
