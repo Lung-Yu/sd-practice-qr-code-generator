@@ -27,7 +27,7 @@ func parseTTL(body []byte) int {
 	var r struct {
 		TTLRemaining int `json:"ttl_remaining"`
 	}
-	json.Unmarshal(body, &r)
+	_ = json.Unmarshal(body, &r) // best-effort; missing or unparseable = no TTL
 	return r.TTLRemaining
 }
 
