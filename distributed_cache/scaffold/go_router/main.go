@@ -20,21 +20,25 @@ import (
 
 const (
 	healthInterval = 2 * time.Second
-	failThreshold  = 2 // consecutive failures before marking DOWN
+	failThreshold  = 2 // consecutive health-poll failures before marking DOWN
+
+	cbFailThreshold = 3               // request failures before circuit OPENS
+	cbOpenTimeout   = 15 * time.Second // how long circuit stays OPEN before HALF_OPEN trial
 )
 
 // ── globals ──────────────────────────────────────────────────────────────────
 
 var (
-	nodeURLs map[string]string
-	ring     *hashRing
+	nodeURLs        map[string]string
+	ring            *hashRing
+	circuitBreakers map[string]*CircuitBreaker // per-node CB, read-only after init
 
-	// health state — separate lock from the ring so they don't block each other
 	healthMu    sync.RWMutex
-	healthState map[string]*nodeHealthState // nodeID → state
+	healthState map[string]*nodeHealthState
 
-	requestsTotal *prometheus.CounterVec
-	routeDuration prometheus.Histogram
+	requestsTotal    *prometheus.CounterVec
+	routeDuration    prometheus.Histogram
+	circuitOpenTotal *prometheus.CounterVec
 
 	proxyClient = &http.Client{
 		Timeout: 5 * time.Second,
@@ -67,12 +71,6 @@ type statsResp struct {
 	Capacity  int64 `json:"capacity"`
 }
 
-type errResp struct {
-	Error string  `json:"error"`
-	Key   string  `json:"key"`
-	Node  *string `json:"node"`
-}
-
 // ── helpers ───────────────────────────────────────────────────────────────────
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
@@ -81,7 +79,6 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	json.NewEncoder(w).Encode(v)
 }
 
-// nodeFor returns (nodeID, base, true) or fails with 503 if ring is empty.
 func nodeFor(w http.ResponseWriter, key string) (nodeID, base string, ok bool) {
 	id, found := ring.nodeForKey(key)
 	if !found {
@@ -92,10 +89,26 @@ func nodeFor(w http.ResponseWriter, key string) (nodeID, base string, ok bool) {
 	return id, nodeURLs[id], true
 }
 
-// proxy forwards a request to a cache node and streams the response back.
-func proxy(w http.ResponseWriter, r *http.Request, targetURL, handler string) {
-	start := time.Now()
+// proxy forwards a request to a node, guarded by that node's circuit breaker.
+//
+// Failure accounting:
+//   - TCP/timeout error  → RecordFailure (node unreachable)
+//   - HTTP 5xx           → RecordFailure (node misbehaving)
+//   - HTTP 2xx / 4xx     → RecordSuccess (normal responses, 404 = cache miss ≠ failure)
+func proxy(w http.ResponseWriter, r *http.Request, nodeID, targetURL, handler string) {
+	cb := circuitBreakers[nodeID]
 
+	if !cb.Allow() {
+		circuitOpenTotal.WithLabelValues(nodeID).Inc()
+		requestsTotal.WithLabelValues(handler, "503").Inc()
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{
+			"error": "circuit_open",
+			"node":  nodeID,
+		})
+		return
+	}
+
+	start := time.Now()
 	req, _ := http.NewRequestWithContext(r.Context(), r.Method, targetURL, r.Body)
 	req.Header = r.Header.Clone()
 	req.ContentLength = r.ContentLength
@@ -104,12 +117,19 @@ func proxy(w http.ResponseWriter, r *http.Request, targetURL, handler string) {
 	routeDuration.Observe(time.Since(start).Seconds())
 
 	if err != nil {
+		cb.RecordFailure()
 		requestsTotal.WithLabelValues(handler, "503").Inc()
 		writeJSON(w, http.StatusServiceUnavailable,
-			map[string]string{"error": "node_unreachable"})
+			map[string]string{"error": "node_unreachable", "node": nodeID})
 		return
 	}
 	defer resp.Body.Close()
+
+	if resp.StatusCode >= 500 {
+		cb.RecordFailure()
+	} else {
+		cb.RecordSuccess() // includes 404 cache miss — that is normal
+	}
 
 	requestsTotal.WithLabelValues(handler, strconv.Itoa(resp.StatusCode)).Inc()
 	for k, vs := range resp.Header {
@@ -125,29 +145,29 @@ func proxy(w http.ResponseWriter, r *http.Request, targetURL, handler string) {
 
 func handleSet(w http.ResponseWriter, r *http.Request) {
 	key := r.PathValue("key")
-	_, base, ok := nodeFor(w, key)
+	nodeID, base, ok := nodeFor(w, key)
 	if !ok {
 		return
 	}
-	proxy(w, r, base+"/cache/"+key, "set")
+	proxy(w, r, nodeID, base+"/cache/"+key, "set")
 }
 
 func handleGet(w http.ResponseWriter, r *http.Request) {
 	key := r.PathValue("key")
-	_, base, ok := nodeFor(w, key)
+	nodeID, base, ok := nodeFor(w, key)
 	if !ok {
 		return
 	}
-	proxy(w, r, base+"/cache/"+key, "get")
+	proxy(w, r, nodeID, base+"/cache/"+key, "get")
 }
 
 func handleDelete(w http.ResponseWriter, r *http.Request) {
 	key := r.PathValue("key")
-	_, base, ok := nodeFor(w, key)
+	nodeID, base, ok := nodeFor(w, key)
 	if !ok {
 		return
 	}
-	proxy(w, r, base+"/cache/"+key, "delete")
+	proxy(w, r, nodeID, base+"/cache/"+key, "delete")
 }
 
 func handleRing(w http.ResponseWriter, r *http.Request) {
@@ -196,23 +216,30 @@ func handleStats(w http.ResponseWriter, r *http.Request) {
 
 func handleHealth(w http.ResponseWriter, r *http.Request) {
 	healthMu.RLock()
-	snapshot := make(map[string]*nodeHealthState, len(healthState))
+	type nodeInfo struct {
+		Alive    bool   `json:"alive"`
+		Failures int    `json:"failures"`
+		Circuit  string `json:"circuit"`
+	}
+	nodes := make(map[string]nodeInfo, len(healthState))
+	degraded := false
 	for id, s := range healthState {
-		snapshot[id] = &nodeHealthState{Alive: s.Alive, Failures: s.Failures}
+		nodes[id] = nodeInfo{
+			Alive:    s.Alive,
+			Failures: s.Failures,
+			Circuit:  circuitBreakers[id].State(),
+		}
+		if !s.Alive {
+			degraded = true
+		}
 	}
 	healthMu.RUnlock()
 
 	status := "ok"
-	for _, s := range snapshot {
-		if !s.Alive {
-			status = "degraded"
-			break
-		}
+	if degraded {
+		status = "degraded"
 	}
-	writeJSON(w, http.StatusOK, map[string]any{
-		"status": status,
-		"nodes":  snapshot,
-	})
+	writeJSON(w, http.StatusOK, map[string]any{"status": status, "nodes": nodes})
 }
 
 // ── health checker ────────────────────────────────────────────────────────────
@@ -234,7 +261,8 @@ func checkNode(nodeID, base string) {
 			s.Failures = 0
 			healthMu.Unlock()
 			ring.addNode(nodeID)
-			log.Printf("[health] node %s recovered → added back to ring", nodeID)
+			circuitBreakers[nodeID].Reset() // node is back, close the circuit
+			log.Printf("[health] node %s recovered → ring restored, circuit closed", nodeID)
 			return
 		}
 		s.Failures = 0
@@ -252,7 +280,6 @@ func checkNode(nodeID, base string) {
 }
 
 func startHealthChecker() {
-	// initialise state — all nodes start as alive (they were just started)
 	healthMu.Lock()
 	for nodeID := range nodeURLs {
 		healthState[nodeID] = &nodeHealthState{Alive: true}
@@ -268,7 +295,8 @@ func startHealthChecker() {
 			}
 		}
 	}()
-	log.Printf("[health] checker started (interval=%s, fail_threshold=%d)", healthInterval, failThreshold)
+	log.Printf("[health] checker started (interval=%s, health_fail=%d, cb_fail=%d, cb_timeout=%s)",
+		healthInterval, failThreshold, cbFailThreshold, cbOpenTimeout)
 }
 
 // ── main ──────────────────────────────────────────────────────────────────────
@@ -304,8 +332,10 @@ func main() {
 	}
 
 	ring = newHashRing(virtualNodes, strat)
+	circuitBreakers = make(map[string]*CircuitBreaker, len(nodeURLs))
 	for nodeID := range nodeURLs {
 		ring.addNode(nodeID)
+		circuitBreakers[nodeID] = NewCB(cbFailThreshold, cbOpenTimeout)
 	}
 
 	healthState = make(map[string]*nodeHealthState)
@@ -320,6 +350,11 @@ func main() {
 		Help:    "Time to route + proxy a request",
 		Buckets: prometheus.DefBuckets,
 	})
+
+	circuitOpenTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "cache_circuit_open_total",
+		Help: "Requests rejected because the node's circuit breaker is open",
+	}, []string{"node"})
 
 	startHealthChecker()
 
