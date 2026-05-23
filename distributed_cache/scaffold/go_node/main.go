@@ -116,6 +116,10 @@ func handleStats(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, cache.Stats())
 }
 
+func handleHealth(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok", "node": nodeID})
+}
+
 // ── main ─────────────────────────────────────────────────────────────────────
 
 func getEnv(key, fallback string) string {
@@ -164,6 +168,7 @@ func main() {
 	mux.HandleFunc("GET /cache/{key}", handleGet)
 	mux.HandleFunc("DELETE /cache/{key}", handleDelete)
 	mux.HandleFunc("GET /stats", handleStats)
+	mux.HandleFunc("GET /health", handleHealth)
 	mux.Handle("GET /metrics", promhttp.Handler())
 
 	log.Printf("Go cache node %s starting on :%s (capacity=%d)", nodeID, port, capacity)
