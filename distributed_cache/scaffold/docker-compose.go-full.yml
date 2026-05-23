@@ -1,6 +1,6 @@
 version: "3.9"
 
-# Full Go stack — Go router + Go nodes.
+# Full Go stack — Go router + Go nodes + Go backing store.
 # Run with:
 #   podman-compose -f docker-compose.yml -f docker-compose.go-full.yml up -d --build
 
@@ -16,6 +16,8 @@ services:
       HASH_STRATEGY: "ring"
       VIRTUAL_NODES: "150"
       ROUTER_PORT: "8000"
+      STORE_URL: "http://dc-store:8004"
+      WRITE_THROUGH_MODE: "${WRITE_THROUGH_MODE:-parallel}"
 
   dc-node1:
     build:
@@ -49,3 +51,14 @@ services:
       NODE_ID: node3
       NODE_PORT: "8003"
       CAPACITY: "100"
+
+  dc-store:
+    build:
+      context: ./go_store
+      dockerfile: Dockerfile
+    image: distributed-cache-go-store:latest
+    command: ["./cache-store"]
+    environment:
+      STORE_PORT: "8004"
+    ports:
+      - "8004:8004"
