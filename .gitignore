@@ -1,0 +1,6 @@
+# Go binaries
+distributed_cache/scaffold/go_router/distributed-cache-router
+distributed_cache/scaffold/go_router/cache-router
+distributed_cache/scaffold/go_store/distributed-cache-store
+distributed_cache/scaffold/go_store/cache-store
+distributed_cache/scaffold/go_node/cache-node
