@@ -129,7 +129,10 @@ func callNode(ctx context.Context, nodeID, method, targetURL string, body []byte
 // callStore sends one request to the backing store and returns the result.
 // No circuit breaker — store failure surfaces directly as node_unreachable.
 func callStore(ctx context.Context, method, key string, body []byte) nodeResult {
-	req, _ := http.NewRequestWithContext(ctx, method, storeURL+"/store/"+key, bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, method, storeURL+"/store/"+key, bytes.NewReader(body))
+	if err != nil {
+		return nodeResult{errMsg: "node_unreachable"}
+	}
 	req.Header.Set("Content-Type", "application/json")
 	req.ContentLength = int64(len(body))
 	resp, err := proxyClient.Do(req)
