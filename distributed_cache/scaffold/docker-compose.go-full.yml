@@ -1,0 +1,51 @@
+version: "3.9"
+
+# Full Go stack — Go router + Go nodes.
+# Run with:
+#   podman-compose -f docker-compose.yml -f docker-compose.go-full.yml up -d --build
+
+services:
+  dc-router:
+    build:
+      context: ./go_router
+      dockerfile: Dockerfile
+    image: distributed-cache-go-router:latest
+    command: ["./cache-router"]
+    environment:
+      NODE_URLS: "http://dc-node1:8001,http://dc-node2:8002,http://dc-node3:8003"
+      HASH_STRATEGY: "ring"
+      VIRTUAL_NODES: "150"
+      ROUTER_PORT: "8000"
+
+  dc-node1:
+    build:
+      context: ./go_node
+      dockerfile: Dockerfile
+    image: distributed-cache-go:latest
+    command: ["./cache-node"]
+    environment:
+      NODE_ID: node1
+      NODE_PORT: "8001"
+      CAPACITY: "100"
+
+  dc-node2:
+    build:
+      context: ./go_node
+      dockerfile: Dockerfile
+    image: distributed-cache-go:latest
+    command: ["./cache-node"]
+    environment:
+      NODE_ID: node2
+      NODE_PORT: "8002"
+      CAPACITY: "100"
+
+  dc-node3:
+    build:
+      context: ./go_node
+      dockerfile: Dockerfile
+    image: distributed-cache-go:latest
+    command: ["./cache-node"]
+    environment:
+      NODE_ID: node3
+      NODE_PORT: "8003"
+      CAPACITY: "100"

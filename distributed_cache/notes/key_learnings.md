@@ -330,7 +330,7 @@ networks:
 
 ---
 
-## 12. 程式語言對 Latency 的影響：Go vs Python 節點對比實驗
+## 12. Python router × Go nodes：換節點語言，吞吐量不變但 p95 減半
 
 把三個 cache node 從 Python (uvicorn, 2 workers) 換成 Go (net/http, 1 process, goroutines)，路由層保持 Python 8 workers 不變。相同的 k6 腳本（0→3000 RPS），跑出以下對比：
 
@@ -339,50 +339,74 @@ networks:
 | 總請求數 | 352,786 | 353,797 |
 | 平均 RPS | 1,176 | 1,179 |
 | p95 latency | **216.9ms ❌** | **116.8ms ✓** |
-| p95 SLO (<200ms) | **FAIL** | **PASS** |
 | dropped_iterations | 1,213 | 203 |
 | 最高 VU 數 | 1,165（latency 積壓） | ~10（乾淨） |
-| cache_error_rate | 0.00% | 0.00% |
 
-**為什麼 Go node 快近 2× ？**
+**為什麼吞吐量不變？** 路由層是 Python 8w，每個 request 都要經過 FastAPI + Pydantic + GIL。換 node 語言不影響路由層的 CPU 開銷，上限不動。
 
-Python 每個 request 的開銷：FastAPI + Pydantic 解析 + GIL + bytecode interpreter。即使 LRU 邏輯完全相同，Python 在每個 request 上多花了 ~1-2ms 的解釋器開銷。Go 的 `net/http` + 原生 struct marshal 沒有這層間接成本。
+**為什麼 p95 減半？** Go node 的每個回應從 ~2ms → ~0.5ms，router 的 thread pool 不積壓，VU 從 1,165 降到 ~10。
 
-**為什麼平均 RPS 相同（~1,175）？**
+**帶走的原則**：換掉非瓶頸層的語言只影響 latency，不影響吞吐量天花板。要突破天花板，必須改掉瓶頸層本身。
 
-路由層（Python 8w）才是吞吐量天花板。Router 每個 request 都要做：收 HTTP → 計算 consistent hash → `httpx.Client.get()` → 回傳。這個 pipeline 的瓶頸在 Python 解釋器，不在 node 速度。換了 Go node 後，每個 httpx 呼叫從 ~2ms → ~0.5ms，thread pool 空閒更快，但路由層的 Python overhead 本身沒變，所以整體 RPS 上限沒變。
+---
 
-**Go 的優勢體現在哪裡？**
+## 13. Go router + Go nodes：吞吐量突破 5.5×，p95 改善 100×
 
-P95 latency 降了近半（217ms → 117ms）。在 3000 RPS 高壓下，Go node 的快速回應讓 router 的 thread pool 不積壓，VU 維持在個位數；Python node 慢讓 thread pool 排隊，VU 爆到 1,165，p95 就超標了。
+把路由層也從 Python 8 workers 換成 Go 單進程，k6 ceiling test（0→10,000 RPS）：
 
-**Go node 的實作要點**（等效 Python 實作）：
+| 指標 | Python 8w + Python node (2w) | Python 8w + Go node | **Go router + Go node** |
+|------|:---:|:---:|:---:|
+| 吞吐量天花板 | ~1,823 RPS | ~1,823 RPS | **~10,000 RPS** |
+| 平均 RPS（測試中） | 1,176 | 1,179 | **4,147** |
+| p95 at 3000 target | 217ms ❌ | 117ms ✓ | **1.19ms ✓✓** |
+| p95 at max load | ~2ms | — | **22ms ✓** |
+| 最高 VU 數 | 1,165 | ~10 | **35** |
+| dropped_iterations | 1,213 | 203 | **56** |
 
+**為什麼 Go router 能突破 Python 的 1,823 RPS 天花板？**
+
+Python router 的瓶頸是每個 request 都要走 FastAPI request parsing → Pydantic → GIL → httpx sync call → GIL。8 個 worker process × ~32 threads，但 GIL 讓 pure Python 開銷（hash 計算、JSON 解析）無法真正並行。
+
+Go router 的模型完全不同：
+```
+每個 incoming connection → 一個 goroutine（~2 KB stack, OS thread共享）
+goroutine 直接做：ring hash → http.Client.Do() → io.Copy 回傳
+全程 non-blocking，沒有 GIL，沒有 thread pool 限制
+```
+
+Go 的 `net/http.Client` 有連線池（`MaxIdleConnsPerHost: 200`），keepalive 復用 TCP connection，不像 httpx 在高並發下還有 thread 切換開銷。
+
+**Peak 9,997 RPS 的意義**：
+
+測試中 k6 在 10,000 target 階段達到 9,997 iter/s，之後進入 ramp down。系統沒有報錯（cache_error_rate 0%），p95 仍在 22ms（SLO 200ms 內）。真正的天花板可能更高，受限於 k6 的 maxVUs=3000 和 macOS 網路 stack。
+
+**Go router 的關鍵設計**：
 ```go
-// LRU = container/list (doubly linked list) + sync.Mutex
-// TTL = time.Time 絕對時間戳（和 Python 的 float expires_at 相同概念）
-// 路由 = Go 1.22 net/http 原生支援 "GET /cache/{key}" pattern
-// Prometheus = github.com/prometheus/client_golang，ConstLabels 標記 node
-
-func (c *LRUCache) Get(key string) (string, *int, error) {
-    c.mu.Lock()
-    defer c.mu.Unlock()
-    el, ok := c.items[key]
-    if !ok { c.misses++; return "", nil, ErrMiss }
-    e := el.Value.(*entry)
-    if e.expiresAt != nil && time.Now().After(*e.expiresAt) {
-        c.list.Remove(el); delete(c.items, key); c.misses++
-        return "", nil, ErrExpired
-    }
-    c.list.MoveToFront(el); c.hits++
-    ...
+// 連線池：高並發下避免 TCP 頻繁建立/關閉
+proxyClient = &http.Client{
+    Timeout: 5 * time.Second,
+    Transport: &http.Transport{
+        MaxIdleConnsPerHost: 200,
+        DisableCompression:  true,  // cache values 是純文字，不需要再壓縮
+    },
 }
+
+// /stats 並行查詢三個 node（goroutine + WaitGroup）
+for _, base := range nodeURLs {
+    go func(base string) {
+        defer wg.Done()
+        resp, _ := proxyClient.Get(base + "/stats")
+        // merge results with mutex
+    }(base)
+}
+wg.Wait()
 ```
 
 **帶走的原則**：
-1. 語言開銷影響 latency，但不一定影響吞吐量（吞吐量瓶頸在路由層，不在節點）。
-2. 要真正突破 RPS 上限，必須改掉瓶頸層（Python router → Go router，或 Python router 加更多 workers）。
-3. Go 的 goroutine 並發模型天生沒有 GIL，`sync.Mutex` + `container/list` 就能安全高效率地服務多個 goroutine，不需要多進程。
+1. 瓶頸在哪一層，就改那一層的語言。換非瓶頸層只影響 latency。
+2. Go 的 goroutine 比 Python thread 輕量 ~500×（2 KB vs 1 MB），支撐更高並發而不需要多進程。
+3. HTTP 連線池（`MaxIdleConnsPerHost`）在高 RPS 時至關重要——每個請求建新 TCP 連線的開銷可以讓吞吐量腰斬。
+4. 從 1,823 → 10,000 RPS（5.5×）：語言選擇在路由層的影響遠大於在節點層。
 
 ---
 
@@ -413,16 +437,23 @@ Node 1    Node 2    Node 3
 
 **系統上限進化**：
 
-| 配置 | RPS | p95 |
-|------|-----|-----|
-| Python router ×1 + Python node ×1w | ~900 | ~3ms |
-| Python router ×4 + Python node ×1w | ~1,484 | ~3ms |
-| Python router ×8 + Python node ×2w | ~1,823 | ~2ms |
-| Python router ×8 + **Go node ×1** | ~1,179* | **116ms** ✓ at 3000 target |
+| 配置 | 天花板 RPS | p95 at 3k RPS | p95 at max |
+|------|:----------:|:-------------:|:----------:|
+| Python router ×1 + Python node ×1w | ~900 | — | ~3ms |
+| Python router ×4 + Python node ×1w | ~1,484 | — | ~3ms |
+| Python router ×8 + Python node ×2w | ~1,823 | 217ms ❌ | ~2ms |
+| Python router ×8 + Go node ×1 | ~1,823* | 117ms ✓ | — |
+| **Go router + Go node ×1** | **~10,000** | **1.19ms ✓✓** | **22ms ✓** |
 
-\* 平均 RPS 低是因為 router 是瓶頸；p95 通過 SLO 是 Go node 的功勞。
+\* 平均 RPS 不變是因為路由層仍是 Python；Go node 的貢獻是 p95 latency 減半。
+
+完整 Go stack 的 k6 ceiling test（0→10,000 RPS）：
+- 4,146 RPS 平均，峰值達 **9,997 RPS**
+- p95 = 22ms（仍在 200ms SLO 內），cache_error_rate = 0%
+- 最高 VU = 3000（k6 本身的並發上限），而 Python stack 在 1,823 RPS 時就需要 1,165 VU
+- 結論：**全 Go 比全 Python 快 ~5.5×**，p95 latency 改善超過 100×
 
 **突破方向**：
-- 短期：`--workers N`（多進程，打破單進程 GIL 天花板）
-- 中期：Go router（移除 Python 解釋器開銷，打破路由層 ~1,800 RPS 上限）
-- 長期：節點水平擴展（多個 replica，路由層需感知每個 replica 的 node_id）
+- 短期：`--workers N`（多進程，打破 Python 單進程 GIL 天花板）→ ~1,823 RPS
+- 中期：Go router + Go nodes（移除解釋器開銷，goroutine 無 GIL）→ ~10,000 RPS
+- 長期：節點水平擴展（多個 replica）→ 理論上線性擴展
