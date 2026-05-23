@@ -103,6 +103,58 @@ func (r *hashRing) rendezvousNode(key string) string {
 	return best
 }
 
+// nodesForKey returns up to n distinct physical nodes for key.
+// nodes[0] is the primary; nodes[1] is the replica (if n >= 2 and ring has >= 2 nodes).
+// Callers must NOT hold r.mu.
+func (r *hashRing) nodesForKey(key string, n int) []string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if len(r.nodes) == 0 {
+		return nil
+	}
+	if r.strat == strategyRendezvous {
+		return r.rendezvousNodes(key, n)
+	}
+	return r.ringNodes(key, n)
+}
+
+// ringNodes walks clockwise from the key's position, collecting up to n
+// distinct physical nodes. Called with r.mu held for reading.
+func (r *hashRing) ringNodes(key string, n int) []string {
+	h := ringHash(key)
+	start := sort.Search(len(r.ring), func(i int) bool { return r.ring[i] > h }) % len(r.ring)
+	seen := make(map[string]struct{})
+	result := make([]string, 0, n)
+	for i := 0; len(result) < n && len(seen) < len(r.nodes); i++ {
+		pos := (start + i) % len(r.ring)
+		nodeID := r.ringMap[r.ring[pos]]
+		if _, ok := seen[nodeID]; !ok {
+			seen[nodeID] = struct{}{}
+			result = append(result, nodeID)
+		}
+	}
+	return result
+}
+
+// rendezvousNodes ranks all nodes by hash score descending, returns top n.
+// Called with r.mu held for reading.
+func (r *hashRing) rendezvousNodes(key string, n int) []string {
+	type scored struct {
+		id    string
+		score uint64
+	}
+	nodes := make([]scored, 0, len(r.nodes))
+	for id := range r.nodes {
+		nodes = append(nodes, scored{id, ringHash(fmt.Sprintf("%s:%s", id, key))})
+	}
+	sort.Slice(nodes, func(i, j int) bool { return nodes[i].score > nodes[j].score })
+	result := make([]string, 0, n)
+	for i := 0; i < n && i < len(nodes); i++ {
+		result = append(result, nodes[i].id)
+	}
+	return result
+}
+
 func (r *hashRing) virtualCount() int {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
