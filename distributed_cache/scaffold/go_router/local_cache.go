@@ -1,6 +1,7 @@
 package main
 
 import (
+	"container/list"
 	"encoding/json"
 	"sync"
 	"sync/atomic"
@@ -42,7 +43,7 @@ func newLocalCache(strategy string, capacity int, rebuildInterval time.Duration,
 	}
 	switch strategy {
 	case "lfu":
-		return &noopCache{} // implemented in Task 3
+		return newLFUCache(capacity)
 	case "periodic":
 		return &noopCache{} // implemented in Task 4
 	default: // "counter"
@@ -179,5 +180,149 @@ func (c *counterCache) Stats() LocalCacheStats {
 		Size:     size,
 		Capacity: c.capacity,
 		Strategy: "counter",
+	}
+}
+
+// ── LFU strategy — exact O(1) LFU with freq buckets ─────────────────────────
+
+type lfuEntry struct {
+	key       string
+	value     []byte
+	freq      uint64
+	expiresAt time.Time
+	listElem  *list.Element // position within freqMap[freq]
+}
+
+type lfuCache struct {
+	mu       sync.RWMutex
+	keyMap   map[string]*lfuEntry  // key → entry
+	freqMap  map[uint64]*list.List // freq → MRU-ordered list of *lfuEntry
+	minFreq  uint64
+	size     int
+	capacity int
+	hits     int64
+	misses   int64
+}
+
+func newLFUCache(capacity int) *lfuCache {
+	return &lfuCache{
+		keyMap:   make(map[string]*lfuEntry),
+		freqMap:  make(map[uint64]*list.List),
+		capacity: capacity,
+	}
+}
+
+func (c *lfuCache) Get(key string) ([]byte, bool) {
+	c.mu.RLock()
+	e, ok := c.keyMap[key]
+	if !ok {
+		c.mu.RUnlock()
+		atomic.AddInt64(&c.misses, 1)
+		return nil, false
+	}
+	expired := !e.expiresAt.IsZero() && time.Now().After(e.expiresAt)
+	var val []byte
+	if !expired {
+		val = e.value
+	}
+	c.mu.RUnlock()
+
+	if expired {
+		c.mu.Lock()
+		if e2, ok2 := c.keyMap[key]; ok2 && !e2.expiresAt.IsZero() && time.Now().After(e2.expiresAt) {
+			c.removeEntry(e2)
+		}
+		c.mu.Unlock()
+		atomic.AddInt64(&c.misses, 1)
+		return nil, false
+	}
+	atomic.AddInt64(&c.hits, 1)
+	return val, true
+}
+
+// removeEntry removes e from keyMap and freqMap. Must hold write lock.
+func (c *lfuCache) removeEntry(e *lfuEntry) {
+	bucket := c.freqMap[e.freq]
+	bucket.Remove(e.listElem)
+	if bucket.Len() == 0 {
+		delete(c.freqMap, e.freq)
+	}
+	delete(c.keyMap, e.key)
+	c.size--
+}
+
+// promoteEntry moves e from freqMap[freq] to freqMap[freq+1]. Must hold write lock.
+func (c *lfuCache) promoteEntry(e *lfuEntry) {
+	oldFreq := e.freq
+	newFreq := oldFreq + 1
+
+	bucket := c.freqMap[oldFreq]
+	bucket.Remove(e.listElem)
+	if bucket.Len() == 0 {
+		delete(c.freqMap, oldFreq)
+		if c.minFreq == oldFreq {
+			c.minFreq = newFreq
+		}
+	}
+
+	e.freq = newFreq
+	if c.freqMap[newFreq] == nil {
+		c.freqMap[newFreq] = list.New()
+	}
+	e.listElem = c.freqMap[newFreq].PushFront(e)
+}
+
+func (c *lfuCache) RecordHit(key string, val []byte) {
+	ttl := parseTTL(val)
+	var expiresAt time.Time
+	if ttl > 0 {
+		expiresAt = time.Now().Add(time.Duration(ttl) * time.Second)
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if e, ok := c.keyMap[key]; ok {
+		c.promoteEntry(e)
+		e.value = val
+		e.expiresAt = expiresAt
+		return
+	}
+
+	if c.size == c.capacity {
+		if bucket := c.freqMap[c.minFreq]; bucket != nil && bucket.Len() > 0 {
+			tail := bucket.Back().Value.(*lfuEntry)
+			c.removeEntry(tail)
+		}
+	}
+
+	e := &lfuEntry{key: key, value: val, freq: 1, expiresAt: expiresAt}
+	if c.freqMap[1] == nil {
+		c.freqMap[1] = list.New()
+	}
+	e.listElem = c.freqMap[1].PushFront(e)
+	c.keyMap[key] = e
+	c.minFreq = 1
+	c.size++
+}
+
+func (c *lfuCache) Invalidate(key string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if e, ok := c.keyMap[key]; ok {
+		c.removeEntry(e)
+	}
+}
+
+func (c *lfuCache) Stats() LocalCacheStats {
+	c.mu.RLock()
+	size := c.size
+	c.mu.RUnlock()
+	return LocalCacheStats{
+		Hits:     atomic.LoadInt64(&c.hits),
+		Misses:   atomic.LoadInt64(&c.misses),
+		Size:     size,
+		Capacity: c.capacity,
+		Strategy: "lfu",
 	}
 }

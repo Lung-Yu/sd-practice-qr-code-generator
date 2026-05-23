@@ -108,3 +108,77 @@ func TestCounterCacheTTLExpiry(t *testing.T) {
 		t.Fatal("expected miss after TTL expiry")
 	}
 }
+
+// ── lfuCache ─────────────────────────────────────────────────────────────────
+
+func TestLFUCacheMissOnEmpty(t *testing.T) {
+	c := newLFUCache(5)
+	if _, ok := c.Get("missing"); ok {
+		t.Fatal("expected miss on empty cache")
+	}
+}
+
+func TestLFUCachePromotesFrequency(t *testing.T) {
+	c := newLFUCache(3)
+	val := makeVal("v", 0)
+	c.RecordHit("k", val)
+	c.RecordHit("k", val) // freq=2
+	got, ok := c.Get("k")
+	if !ok {
+		t.Fatal("expected hit")
+	}
+	if string(got) != string(val) {
+		t.Fatalf("got %q, want %q", got, val)
+	}
+	if c.Stats().Size != 1 {
+		t.Fatalf("expected size=1, got %d", c.Stats().Size)
+	}
+}
+
+func TestLFUCacheEvictsLeastFrequent(t *testing.T) {
+	c := newLFUCache(2)
+	v := makeVal("v", 0)
+	c.RecordHit("a", v) // a: freq=1
+	c.RecordHit("b", v) // b: freq=1
+	c.RecordHit("a", v) // a: freq=2
+	// capacity=2 full; inserting c must evict b (freq=1, LFU)
+	c.RecordHit("c", v)
+	if _, ok := c.Get("b"); ok {
+		t.Fatal("b (freq=1, LFU) should have been evicted")
+	}
+	if _, ok := c.Get("a"); !ok {
+		t.Fatal("a (freq=2) should remain")
+	}
+	if _, ok := c.Get("c"); !ok {
+		t.Fatal("c (new) should be in cache")
+	}
+}
+
+func TestLFUCacheInvalidate(t *testing.T) {
+	c := newLFUCache(5)
+	v := makeVal("v", 0)
+	c.RecordHit("k", v)
+	if _, ok := c.Get("k"); !ok {
+		t.Fatal("expected hit before invalidate")
+	}
+	c.Invalidate("k")
+	if _, ok := c.Get("k"); ok {
+		t.Fatal("expected miss after invalidate")
+	}
+	if c.Stats().Size != 0 {
+		t.Fatalf("expected size=0, got %d", c.Stats().Size)
+	}
+}
+
+func TestLFUCacheTTLExpiry(t *testing.T) {
+	c := newLFUCache(5)
+	val := makeVal("v", 1) // ttl_remaining=1 second
+	c.RecordHit("k", val)
+	if _, ok := c.Get("k"); !ok {
+		t.Fatal("expected hit immediately after RecordHit")
+	}
+	time.Sleep(1100 * time.Millisecond)
+	if _, ok := c.Get("k"); ok {
+		t.Fatal("expected miss after TTL expiry")
+	}
+}
