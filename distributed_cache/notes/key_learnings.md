@@ -457,3 +457,65 @@ Node 1    Node 2    Node 3
 - 短期：`--workers N`（多進程，打破 Python 單進程 GIL 天花板）→ ~1,823 RPS
 - 中期：Go router + Go nodes（移除解釋器開銷，goroutine 無 GIL）→ ~10,000 RPS
 - 長期：節點水平擴展（多個 replica）→ 理論上線性擴展
+
+---
+
+## 14. Node Failure + Health Check：AP 行為的具體表現
+
+### 實作
+
+Router 每 2 秒對所有節點的 `/health` 發一個 HTTP GET。連續 2 次失敗（≈4s 偵測窗口）→ 將該節點從 consistent hash ring 移除；1 次成功 → 加回。Ring 操作用 `sync.RWMutex` 保護，request handler 與 health checker goroutine 不互相阻塞。
+
+### 測試觀察（`scripts/test_node_failure.sh`）
+
+```
+Seed: key1→node3, key5→node1, key10→node2 …
+
+Stop dc-node2 → wait 6s
+
+Health: node2 alive=False, failures=3  (degraded)
+
+Access 30 keys:
+  hits=25, misses=5, errors=0   ← 0 個 503
+
+Ring after failure:
+  key10 → node1  (原本 node2，自動 reroute)
+
+Restart dc-node2 → wait 6s
+
+Health: node2 alive=True  (ok)
+Re-seed: nodes used = node1 node2 node3  ← node2 回到輪換
+```
+
+### 為什麼是 AP，不是 CP？
+
+**CAP 定理**：分散式系統在網路分割（Partition）發生時，只能二選一：
+
+| 選擇 | 行為 | 這個系統 |
+|------|------|:--------:|
+| **CP**（一致性優先） | node2 不可達 → 拒絕服務 node2 的 key，回傳 503 | ✗ |
+| **AP**（可用性優先） | node2 不可達 → key 自動 reroute 給其他節點，繼續服務 | ✓ |
+
+這個系統選 AP：Router 把 node2 的 key 「悄悄」reroute 給 ring 上的下一個節點。那個節點沒有這些 key（in-memory，node2 掛掉資料就丟了），所以回傳 404 cache miss，讓 client 自己回 source DB 拿。**系統不停服，但資料暫時不一致（遺失）**。
+
+### AP 的代價：Cache Miss Storm
+
+node2 下線後，原本 node2 負責的 ~1/3 key 全部 cache miss。如果 cache miss 需要回 DB，DB 會瞬間承受 3× 的流量（所有這些 key 的請求都直打 DB）。這就是所謂的 **thundering herd**。
+
+緩解方式（這個 exercise 沒實作，但值得知道）：
+- **Circuit breaker on cache miss**：DB 前加限流
+- **Probabilistic early expiration**（PER）：在 TTL 到期前 stochastic 地 refresh，分散 miss 時機
+- **Replica（寫兩個節點）**：node2 掛掉時從 replica 讀，代價是寫入成本加倍、複雜度上升
+
+### CP 的代價：部分不可用
+
+如果改成 CP 行為（不 reroute，直接 503），系統在 node2 下線期間有 ~1/3 的 key 完全無法讀寫，直到 node2 回來或人工介入（把那批 key 遷移走）。對某些場景（e.g. 金融交易、session token）這是正確選擇；對純 cache（miss 就回 DB）通常不必要。
+
+### Consistent Hashing 在 AP 裡的角色
+
+Ring 移除 node2 後，那些 key 不是「消失」，而是自動轉移到 ring 上的 **下一個節點**。這是 consistent hashing 的核心優勢：加/移節點只影響 1/N 的 key（不是全部），且路由邏輯完全在 router 端，節點本身不感知彼此存在。
+
+**帶走的原則**：
+1. 在設計 cache 系統時，要明確選擇 AP 或 CP，並把代價（miss storm vs 部分 503）暴露給上游。
+2. Health check 的偵測窗口（這裡 4s）= interval × threshold，這段時間內 in-flight 請求仍可能 503，是不可避免的 gap。要縮短 gap 就要縮短 interval（成本：更多空請求），或用 passive 偵測（直接捕捉 proxy 的連線錯誤，第一次失敗就移環）。
+3. Node 恢復後 ring 加回，但 node 上的 cache 是空的。如果下游不能承受 miss storm，需要 **warm-up**（重新把 key 搬回去）再讓 router 把流量切回來。
