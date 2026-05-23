@@ -191,7 +191,7 @@ func handleSet(w http.ResponseWriter, r *http.Request) {
 	body, _ := io.ReadAll(r.Body)
 
 	if len(nodes) == 1 {
-		// Degraded ring (only one node alive) — single write, no replication
+		// Degraded ring (only one node alive) — single write, no replication or store
 		res := callNode(r.Context(), nodes[0], "POST",
 			nodeURLs[nodes[0]]+"/cache/"+key, body, r.Header)
 		if res.errMsg != "" {
@@ -205,32 +205,121 @@ func handleSet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Sync replication: parallel write to primary (nodes[0]) + replica (nodes[1])
-	results := make([]nodeResult, 2)
-	var wg sync.WaitGroup
-	wg.Add(2)
-	for i, nodeID := range nodes[:2] {
-		go func(i int, nodeID string) {
-			defer wg.Done()
-			results[i] = callNode(r.Context(), nodeID, "POST",
-				nodeURLs[nodeID]+"/cache/"+key, body, r.Header)
-		}(i, nodeID)
+	// writeCacheNodes writes to primary + replica in parallel and returns their results.
+	writeCacheNodes := func() []nodeResult {
+		results := make([]nodeResult, 2)
+		var wg sync.WaitGroup
+		wg.Add(2)
+		for i, nodeID := range nodes[:2] {
+			go func(i int, nodeID string) {
+				defer wg.Done()
+				results[i] = callNode(r.Context(), nodeID, "POST",
+					nodeURLs[nodeID]+"/cache/"+key, body, r.Header)
+			}(i, nodeID)
+		}
+		wg.Wait()
+		return results
 	}
-	wg.Wait()
 
-	for i, nodeID := range nodes[:2] {
-		res := results[i]
-		if res.errMsg != "" || res.status >= 500 {
+	if storeURL == "" {
+		// No backing store — RF=2 replication only (original behaviour)
+		results := writeCacheNodes()
+		for i, nodeID := range nodes[:2] {
+			if results[i].errMsg != "" || results[i].status >= 500 {
+				requestsTotal.WithLabelValues("set", "503").Inc()
+				writeJSON(w, http.StatusServiceUnavailable, map[string]string{
+					"error": "replication_failed", "node": nodeID,
+				})
+				return
+			}
+		}
+		requestsTotal.WithLabelValues("set", strconv.Itoa(results[0].status)).Inc()
+		writeResult(w, results[0])
+		return
+	}
+
+	switch writeThroughMode {
+	case "store_first":
+		// Write store first; abort if store fails. Cache failure is best-effort (200).
+		sr := callStore(r.Context(), "POST", key, body)
+		if sr.errMsg != "" || sr.status >= 500 {
+			requestsTotal.WithLabelValues("set", "503").Inc()
+			writeJSON(w, http.StatusServiceUnavailable,
+				map[string]string{"error": "write_through_failed", "failed": "store"})
+			return
+		}
+		results := writeCacheNodes()
+		for i, nodeID := range nodes[:2] {
+			if results[i].errMsg != "" || results[i].status >= 500 {
+				log.Printf("[write_through] store_first: cache write failed for %s (key=%s), store written", nodeID, key)
+			}
+		}
+		// Return primary cache response if available; otherwise synthetic ok
+		if results[0].errMsg == "" && results[0].status < 500 {
+			requestsTotal.WithLabelValues("set", strconv.Itoa(results[0].status)).Inc()
+			writeResult(w, results[0])
+		} else {
+			requestsTotal.WithLabelValues("set", "200").Inc()
+			writeJSON(w, http.StatusOK, map[string]string{"key": key, "status": "stored", "warning": "cache_write_failed"})
+		}
+
+	case "cache_first":
+		// Write cache first; abort if cache fails. Store failure is best-effort (200).
+		results := writeCacheNodes()
+		for i, nodeID := range nodes[:2] {
+			if results[i].errMsg != "" || results[i].status >= 500 {
+				requestsTotal.WithLabelValues("set", "503").Inc()
+				writeJSON(w, http.StatusServiceUnavailable, map[string]string{
+					"error": "replication_failed", "node": nodeID,
+				})
+				return
+			}
+		}
+		sr := callStore(r.Context(), "POST", key, body)
+		if sr.errMsg != "" || sr.status >= 500 {
+			log.Printf("[write_through] cache_first: store write failed (key=%s), cache written", key)
+		}
+		requestsTotal.WithLabelValues("set", strconv.Itoa(results[0].status)).Inc()
+		writeResult(w, results[0])
+
+	default: // "parallel"
+		// Write cache nodes + store simultaneously; all three must succeed.
+		cacheResults := make([]nodeResult, 2)
+		var storeResult nodeResult
+		var wg sync.WaitGroup
+		wg.Add(3)
+		for i, nodeID := range nodes[:2] {
+			go func(i int, nodeID string) {
+				defer wg.Done()
+				cacheResults[i] = callNode(r.Context(), nodeID, "POST",
+					nodeURLs[nodeID]+"/cache/"+key, body, r.Header)
+			}(i, nodeID)
+		}
+		go func() {
+			defer wg.Done()
+			storeResult = callStore(r.Context(), "POST", key, body)
+		}()
+		wg.Wait()
+
+		for i, nodeID := range nodes[:2] {
+			if cacheResults[i].errMsg != "" || cacheResults[i].status >= 500 {
+				requestsTotal.WithLabelValues("set", "503").Inc()
+				writeJSON(w, http.StatusServiceUnavailable, map[string]string{
+					"error": "write_through_failed", "failed": nodeID,
+				})
+				return
+			}
+		}
+		if storeResult.errMsg != "" || storeResult.status >= 500 {
 			requestsTotal.WithLabelValues("set", "503").Inc()
 			writeJSON(w, http.StatusServiceUnavailable, map[string]string{
-				"error": "replication_failed",
-				"node":  nodeID,
+				"error": "write_through_failed", "failed": "store",
 			})
 			return
 		}
+		requestsTotal.WithLabelValues("set", strconv.Itoa(cacheResults[0].status)).Inc()
+		writeResult(w, cacheResults[0])
 	}
-	requestsTotal.WithLabelValues("set", strconv.Itoa(results[0].status)).Inc()
-	writeResult(w, results[0])
 }
 
 func handleGet(w http.ResponseWriter, r *http.Request) {
@@ -285,31 +374,115 @@ func handleDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	results := make([]nodeResult, 2)
-	var wg sync.WaitGroup
-	wg.Add(2)
-	for i, nodeID := range nodes[:2] {
-		go func(i int, nodeID string) {
-			defer wg.Done()
-			results[i] = callNode(r.Context(), nodeID, "DELETE",
-				nodeURLs[nodeID]+"/cache/"+key, body, r.Header)
-		}(i, nodeID)
+	deleteCacheNodes := func() []nodeResult {
+		results := make([]nodeResult, 2)
+		var wg sync.WaitGroup
+		wg.Add(2)
+		for i, nodeID := range nodes[:2] {
+			go func(i int, nodeID string) {
+				defer wg.Done()
+				results[i] = callNode(r.Context(), nodeID, "DELETE",
+					nodeURLs[nodeID]+"/cache/"+key, body, r.Header)
+			}(i, nodeID)
+		}
+		wg.Wait()
+		return results
 	}
-	wg.Wait()
 
-	for i, nodeID := range nodes[:2] {
-		res := results[i]
-		if res.errMsg != "" || res.status >= 500 {
+	if storeURL == "" {
+		results := deleteCacheNodes()
+		for i, nodeID := range nodes[:2] {
+			if results[i].errMsg != "" || results[i].status >= 500 {
+				requestsTotal.WithLabelValues("delete", "503").Inc()
+				writeJSON(w, http.StatusServiceUnavailable, map[string]string{
+					"error": "replication_failed", "node": nodeID,
+				})
+				return
+			}
+		}
+		requestsTotal.WithLabelValues("delete", strconv.Itoa(results[0].status)).Inc()
+		writeResult(w, results[0])
+		return
+	}
+
+	switch writeThroughMode {
+	case "store_first":
+		sr := callStore(r.Context(), "DELETE", key, body)
+		if sr.errMsg != "" || sr.status >= 500 {
+			requestsTotal.WithLabelValues("delete", "503").Inc()
+			writeJSON(w, http.StatusServiceUnavailable,
+				map[string]string{"error": "write_through_failed", "failed": "store"})
+			return
+		}
+		results := deleteCacheNodes()
+		for i, nodeID := range nodes[:2] {
+			if results[i].errMsg != "" || results[i].status >= 500 {
+				log.Printf("[write_through] store_first: cache delete failed for %s (key=%s)", nodeID, key)
+			}
+		}
+		if results[0].errMsg == "" && results[0].status < 500 {
+			requestsTotal.WithLabelValues("delete", strconv.Itoa(results[0].status)).Inc()
+			writeResult(w, results[0])
+		} else {
+			requestsTotal.WithLabelValues("delete", "200").Inc()
+			writeJSON(w, http.StatusOK, map[string]string{"key": key, "status": "deleted", "warning": "cache_delete_failed"})
+		}
+
+	case "cache_first":
+		results := deleteCacheNodes()
+		for i, nodeID := range nodes[:2] {
+			if results[i].errMsg != "" || results[i].status >= 500 {
+				requestsTotal.WithLabelValues("delete", "503").Inc()
+				writeJSON(w, http.StatusServiceUnavailable, map[string]string{
+					"error": "replication_failed", "node": nodeID,
+				})
+				return
+			}
+		}
+		sr := callStore(r.Context(), "DELETE", key, body)
+		if sr.errMsg != "" || sr.status >= 500 {
+			log.Printf("[write_through] cache_first: store delete failed (key=%s)", key)
+		}
+		requestsTotal.WithLabelValues("delete", strconv.Itoa(results[0].status)).Inc()
+		writeResult(w, results[0])
+
+	default: // "parallel"
+		cacheResults := make([]nodeResult, 2)
+		var storeResult nodeResult
+		var wg sync.WaitGroup
+		wg.Add(3)
+		for i, nodeID := range nodes[:2] {
+			go func(i int, nodeID string) {
+				defer wg.Done()
+				cacheResults[i] = callNode(r.Context(), nodeID, "DELETE",
+					nodeURLs[nodeID]+"/cache/"+key, body, r.Header)
+			}(i, nodeID)
+		}
+		go func() {
+			defer wg.Done()
+			storeResult = callStore(r.Context(), "DELETE", key, body)
+		}()
+		wg.Wait()
+
+		for i, nodeID := range nodes[:2] {
+			if cacheResults[i].errMsg != "" || cacheResults[i].status >= 500 {
+				requestsTotal.WithLabelValues("delete", "503").Inc()
+				writeJSON(w, http.StatusServiceUnavailable, map[string]string{
+					"error": "write_through_failed", "failed": nodeID,
+				})
+				return
+			}
+		}
+		if storeResult.errMsg != "" || storeResult.status >= 500 {
 			requestsTotal.WithLabelValues("delete", "503").Inc()
 			writeJSON(w, http.StatusServiceUnavailable, map[string]string{
-				"error": "replication_failed",
-				"node":  nodeID,
+				"error": "write_through_failed", "failed": "store",
 			})
 			return
 		}
+		requestsTotal.WithLabelValues("delete", strconv.Itoa(cacheResults[0].status)).Inc()
+		writeResult(w, cacheResults[0])
 	}
-	requestsTotal.WithLabelValues("delete", strconv.Itoa(results[0].status)).Inc()
-	writeResult(w, results[0])
 }
 
 func handleRing(w http.ResponseWriter, r *http.Request) {
