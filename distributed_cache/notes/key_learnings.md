@@ -637,3 +637,61 @@ spike 代表某節點正在故障；spike 消失代表 health checker 已移除�
 2. **404 ≠ 失敗**：cache miss 是正常業務行為，不能算進 CB 失敗計數。設計 CB 時要明確定義「什麼是失敗」，而不是「所有非 200」。
 3. **CB 與 ring 的生命週期要連動**：recovery 時要同時 `ring.addNode` + `cb.Reset()`，否則流量切回來但 CB 還開著，保護機制變成阻塞。
 4. **HALF_OPEN 的「一個試探」語意**：只放行一個請求，其他人繼續 fast-fail，直到那個試探有結果。這確保 recovery 是漸進的，不是「timeout 到了全部湧進來」的二次衝擊。
+
+---
+
+## 16. Write-Through Cache：三種一致性模式的代價
+
+### 問題：Cache 與 DB 的數據不一致
+
+In-memory cache 重啟就丟失所有數據。如果 client 的 SET 只寫進 cache，沒有同時寫入 DB，節點 crash 後就永久丟失。Write-through 解決「寫入持久化」的問題——每次 SET 都同時更新 cache 和 backing store（DB）。
+
+### 三種寫入模式的比較
+
+| 模式 | Cache 掛 | Store 掛 | 一致性保證 |
+|------|---------|---------|-----------|
+| `parallel` | 503 | 503 | 最強：兩邊都成功才 200 |
+| `store_first` | 200（cache 冷） | 503 | DB 優先：至少 DB 有資料 |
+| `cache_first` | 503 | 200（store 舊） | Cache 優先：至少 cache 有資料 |
+
+### 觀察到的行為差異
+
+**`parallel` 模式**：
+```
+store 掛掉 → POST /cache/key → 503 write_through_failed
+cache node 掛掉 → POST /cache/key → 503 write_through_failed
+```
+寫入可用性最低，但一致性最強。
+
+**`store_first` 模式**：
+```
+cache node 掛掉 → POST /cache/key → 200
+  → store 有這個 key
+  → GET /cache/key → 404（cache cold，不 read-through）
+```
+DB 是 source of truth。Cache 只是加速層；cache miss 是正常的降級狀態。
+
+**`cache_first` 模式**：
+```
+store 掛掉 → POST /cache/key → 200
+  → cache 有這個 key
+  → GET /store/key → 404（store stale）
+  → store 恢復後，這個 key 仍然不在 store 裡（沒有 backfill）
+```
+Cache 優先，但存在「store 永久遺失資料」的風險，除非有 backfill 機制。
+
+### Write-Through 的根本取捨
+
+| 取捨 | 說明 |
+|------|------|
+| 寫入延遲 | parallel: +~0ms（與複製一樣，latency = max(cache, store)） |
+| 寫入可用性 | parallel < store_first ≈ cache_first |
+| 資料持久性 | parallel = store_first > cache_first |
+| 讀取行為 | GET miss 仍 404（no read-through）；這是獨立的設計選擇 |
+
+### 帶走的原則
+
+1. **Write-through vs Write-back**：Write-through 是同步寫入（latency 上升但不丟資料）；write-back 是非同步寫入（latency 低但 crash 時 dirty buffer 丟失）。選擇取決於資料的重要性。
+2. **模式選擇 = 失敗時你信任哪邊**：`store_first` = 信任 DB；`cache_first` = 信任 cache（適合 DB 很慢、可以最終一致的場景）。
+3. **No read-through 是一個有意識的選擇**：Read-through 讓 cache 透明（client 不感知 miss），但增加複雜度（router 需要知道 DB schema）。這個系統選擇 miss → 404，讓 client 自己決定要不要回 DB 拿。
+4. **Backfill 問題**：`cache_first` 模式下 store 掛掉恢復後，cache 裡的 key 不會自動同步回 store。需要額外的 reconciliation 機制（定期掃描 cache、CDC 等）才能解決持久性問題。
