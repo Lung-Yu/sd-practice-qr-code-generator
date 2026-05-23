@@ -223,7 +223,10 @@ func handleGet(w http.ResponseWriter, r *http.Request) {
 		res := callNode(r.Context(), nodeID, "GET",
 			nodeURLs[nodeID]+"/cache/"+key, nil, r.Header)
 		if res.errMsg != "" {
-			continue // try replica
+			// Transport failure (circuit_open or node_unreachable) → try replica.
+			// HTTP 5xx is not retried (errMsg is empty then); CB records it so the
+			// circuit opens and the next request will fall back automatically.
+			continue
 		}
 		requestsTotal.WithLabelValues("get", strconv.Itoa(res.status)).Inc()
 		writeResult(w, res)
