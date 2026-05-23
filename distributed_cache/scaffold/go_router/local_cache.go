@@ -148,6 +148,7 @@ func (c *counterCache) RecordHit(key string, val []byte) {
 }
 
 // rescanMin does a linear O(K) scan to find the entry with the lowest count.
+// On an empty cache, minCount stays at maxUint64 so any future insertion is accepted.
 func (c *counterCache) rescanMin() {
 	c.minKey = ""
 	c.minCount = ^uint64(0)
