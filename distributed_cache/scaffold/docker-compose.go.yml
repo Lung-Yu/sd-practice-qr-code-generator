@@ -1,0 +1,44 @@
+version: "3.9"
+
+# Go node variant — swap in with:
+#   podman-compose -f docker-compose.yml -f docker-compose.go.yml up -d --build
+#
+# Overrides dc-node1/2/3 with the Go binary (single process, goroutine-native concurrency).
+# The router stays Python so we isolate the language variable to the cache nodes.
+
+services:
+  dc-router:
+    command: ["uvicorn", "app.router_api:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "8"]
+
+  dc-node1:
+    build:
+      context: ./go_node
+      dockerfile: Dockerfile
+    image: distributed-cache-go:latest
+    command: ["./cache-node"]
+    environment:
+      NODE_ID: node1
+      NODE_PORT: "8001"
+      CAPACITY: "100"
+
+  dc-node2:
+    build:
+      context: ./go_node
+      dockerfile: Dockerfile
+    image: distributed-cache-go:latest
+    command: ["./cache-node"]
+    environment:
+      NODE_ID: node2
+      NODE_PORT: "8002"
+      CAPACITY: "100"
+
+  dc-node3:
+    build:
+      context: ./go_node
+      dockerfile: Dockerfile
+    image: distributed-cache-go:latest
+    command: ["./cache-node"]
+    environment:
+      NODE_ID: node3
+      NODE_PORT: "8003"
+      CAPACITY: "100"
