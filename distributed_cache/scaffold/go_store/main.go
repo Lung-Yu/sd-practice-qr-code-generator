@@ -6,12 +6,21 @@ import (
 	"net/http"
 	"os"
 	"sync"
+	"time"
 )
 
 var (
 	mu    sync.RWMutex
 	store = map[string]json.RawMessage{}
 )
+
+func writeJSON(w http.ResponseWriter, status int, v any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	if err := json.NewEncoder(w).Encode(v); err != nil {
+		log.Printf("writeJSON encode error: %v", err)
+	}
+}
 
 func main() {
 	port := os.Getenv("STORE_PORT")
@@ -22,20 +31,17 @@ func main() {
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("POST /store/{key}", func(w http.ResponseWriter, r *http.Request) {
+		r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 		key := r.PathValue("key")
 		var body json.RawMessage
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusBadRequest)
-			json.NewEncoder(w).Encode(map[string]string{"error": "bad_request"})
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "bad_request"})
 			return
 		}
 		mu.Lock()
 		store[key] = body
 		mu.Unlock()
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		json.NewEncoder(w).Encode(map[string]string{"key": key, "status": "stored"})
+		writeJSON(w, http.StatusOK, map[string]string{"key": key, "status": "stored"})
 	})
 
 	mux.HandleFunc("GET /store/{key}", func(w http.ResponseWriter, r *http.Request) {
@@ -44,13 +50,13 @@ func main() {
 		v, ok := store[key]
 		mu.RUnlock()
 		if !ok {
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusNotFound)
-			json.NewEncoder(w).Encode(map[string]string{"error": "miss", "key": key})
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "miss", "key": key})
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
-		w.Write(v)
+		if _, err := w.Write(v); err != nil {
+			log.Printf("write error: %v", err)
+		}
 	})
 
 	mux.HandleFunc("DELETE /store/{key}", func(w http.ResponseWriter, r *http.Request) {
@@ -58,16 +64,20 @@ func main() {
 		mu.Lock()
 		delete(store, key)
 		mu.Unlock()
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		json.NewEncoder(w).Encode(map[string]string{"key": key, "status": "deleted"})
+		writeJSON(w, http.StatusOK, map[string]string{"key": key, "status": "deleted"})
 	})
 
 	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	})
 
+	srv := &http.Server{
+		Addr:         ":" + port,
+		Handler:      mux,
+		ReadTimeout:  5 * time.Second,
+		WriteTimeout: 10 * time.Second,
+		IdleTimeout:  30 * time.Second,
+	}
 	log.Printf("go_store listening on :%s", port)
-	log.Fatal(http.ListenAndServe(":"+port, mux))
+	log.Fatal(srv.ListenAndServe())
 }
