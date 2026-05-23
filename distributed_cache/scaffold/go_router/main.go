@@ -168,11 +168,55 @@ func proxy(w http.ResponseWriter, r *http.Request, nodeID, targetURL, handler st
 
 func handleSet(w http.ResponseWriter, r *http.Request) {
 	key := r.PathValue("key")
-	nodeID, base, ok := nodeFor(w, key)
-	if !ok {
+	nodes := ring.nodesForKey(key, 2)
+	if len(nodes) == 0 {
+		writeJSON(w, http.StatusServiceUnavailable,
+			map[string]string{"error": "no_nodes_available"})
 		return
 	}
-	proxy(w, r, nodeID, base+"/cache/"+key, "set")
+	body, _ := io.ReadAll(r.Body)
+
+	if len(nodes) == 1 {
+		// Degraded ring (only one node alive) — single write, no replication
+		res := callNode(r.Context(), nodes[0], "POST",
+			nodeURLs[nodes[0]]+"/cache/"+key, body, r.Header)
+		if res.errMsg != "" {
+			requestsTotal.WithLabelValues("set", "503").Inc()
+			writeJSON(w, http.StatusServiceUnavailable,
+				map[string]string{"error": res.errMsg, "node": nodes[0]})
+			return
+		}
+		requestsTotal.WithLabelValues("set", strconv.Itoa(res.status)).Inc()
+		writeResult(w, res)
+		return
+	}
+
+	// Sync replication: parallel write to primary (nodes[0]) + replica (nodes[1])
+	results := make([]nodeResult, 2)
+	var wg sync.WaitGroup
+	wg.Add(2)
+	for i, nodeID := range nodes[:2] {
+		go func(i int, nodeID string) {
+			defer wg.Done()
+			results[i] = callNode(r.Context(), nodeID, "POST",
+				nodeURLs[nodeID]+"/cache/"+key, body, r.Header)
+		}(i, nodeID)
+	}
+	wg.Wait()
+
+	for i, nodeID := range nodes[:2] {
+		res := results[i]
+		if res.errMsg != "" || res.status >= 500 {
+			requestsTotal.WithLabelValues("set", "503").Inc()
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{
+				"error": "replication_failed",
+				"node":  nodeID,
+			})
+			return
+		}
+	}
+	requestsTotal.WithLabelValues("set", strconv.Itoa(results[0].status)).Inc()
+	writeResult(w, results[0])
 }
 
 func handleGet(w http.ResponseWriter, r *http.Request) {
@@ -186,11 +230,53 @@ func handleGet(w http.ResponseWriter, r *http.Request) {
 
 func handleDelete(w http.ResponseWriter, r *http.Request) {
 	key := r.PathValue("key")
-	nodeID, base, ok := nodeFor(w, key)
-	if !ok {
+	nodes := ring.nodesForKey(key, 2)
+	if len(nodes) == 0 {
+		writeJSON(w, http.StatusServiceUnavailable,
+			map[string]string{"error": "no_nodes_available"})
 		return
 	}
-	proxy(w, r, nodeID, base+"/cache/"+key, "delete")
+	body, _ := io.ReadAll(r.Body)
+
+	if len(nodes) == 1 {
+		res := callNode(r.Context(), nodes[0], "DELETE",
+			nodeURLs[nodes[0]]+"/cache/"+key, body, r.Header)
+		if res.errMsg != "" {
+			requestsTotal.WithLabelValues("delete", "503").Inc()
+			writeJSON(w, http.StatusServiceUnavailable,
+				map[string]string{"error": res.errMsg, "node": nodes[0]})
+			return
+		}
+		requestsTotal.WithLabelValues("delete", strconv.Itoa(res.status)).Inc()
+		writeResult(w, res)
+		return
+	}
+
+	results := make([]nodeResult, 2)
+	var wg sync.WaitGroup
+	wg.Add(2)
+	for i, nodeID := range nodes[:2] {
+		go func(i int, nodeID string) {
+			defer wg.Done()
+			results[i] = callNode(r.Context(), nodeID, "DELETE",
+				nodeURLs[nodeID]+"/cache/"+key, body, r.Header)
+		}(i, nodeID)
+	}
+	wg.Wait()
+
+	for i, nodeID := range nodes[:2] {
+		res := results[i]
+		if res.errMsg != "" || res.status >= 500 {
+			requestsTotal.WithLabelValues("delete", "503").Inc()
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{
+				"error": "replication_failed",
+				"node":  nodeID,
+			})
+			return
+		}
+	}
+	requestsTotal.WithLabelValues("delete", strconv.Itoa(results[0].status)).Inc()
+	writeResult(w, results[0])
 }
 
 func handleRing(w http.ResponseWriter, r *http.Request) {
