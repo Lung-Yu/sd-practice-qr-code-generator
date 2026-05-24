@@ -55,6 +55,10 @@ var (
 var (
 	storeURL         string // empty → write-through disabled
 	writeThroughMode string // "parallel" | "store_first" | "cache_first"
+
+	localCache            LocalCache
+	localCacheHitsTotal   prometheus.Counter
+	localCacheMissesTotal prometheus.Counter
 )
 
 type nodeHealthState struct {
@@ -182,6 +186,7 @@ func proxy(w http.ResponseWriter, r *http.Request, nodeID, targetURL, handler st
 
 func handleSet(w http.ResponseWriter, r *http.Request) {
 	key := r.PathValue("key")
+	defer localCache.Invalidate(key)
 	nodes := ring.nodesForKey(key, 2)
 	if len(nodes) == 0 {
 		writeJSON(w, http.StatusServiceUnavailable,
@@ -324,6 +329,18 @@ func handleSet(w http.ResponseWriter, r *http.Request) {
 
 func handleGet(w http.ResponseWriter, r *http.Request) {
 	key := r.PathValue("key")
+
+	// L1 hit — serve from local cache, zero node hop.
+	if val, ok := localCache.Get(key); ok {
+		localCacheHitsTotal.Inc()
+		requestsTotal.WithLabelValues("get", "200").Inc()
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		w.Write(val) //nolint:errcheck
+		return
+	}
+	localCacheMissesTotal.Inc()
+
 	nodes := ring.nodesForKey(key, 2)
 	if len(nodes) == 0 {
 		requestsTotal.WithLabelValues("get", "503").Inc()
@@ -335,16 +352,15 @@ func handleGet(w http.ResponseWriter, r *http.Request) {
 		res := callNode(r.Context(), nodeID, "GET",
 			nodeURLs[nodeID]+"/cache/"+key, nil, r.Header)
 		if res.errMsg != "" {
-			// Transport failure (circuit_open or node_unreachable) → try replica.
-			// HTTP 5xx is not retried (errMsg is empty then); CB records it so the
-			// circuit opens and the next request will fall back automatically.
 			continue
+		}
+		if res.status == http.StatusOK {
+			localCache.RecordHit(key, res.body)
 		}
 		requestsTotal.WithLabelValues("get", strconv.Itoa(res.status)).Inc()
 		writeResult(w, res)
 		return
 	}
-	// All nodes in the replication set are unreachable
 	requestsTotal.WithLabelValues("get", "503").Inc()
 	writeJSON(w, http.StatusServiceUnavailable,
 		map[string]string{"error": "no_nodes_available"})
@@ -352,6 +368,7 @@ func handleGet(w http.ResponseWriter, r *http.Request) {
 
 func handleDelete(w http.ResponseWriter, r *http.Request) {
 	key := r.PathValue("key")
+	defer localCache.Invalidate(key)
 	nodes := ring.nodesForKey(key, 2)
 	if len(nodes) == 0 {
 		writeJSON(w, http.StatusServiceUnavailable,
@@ -561,7 +578,11 @@ func handleHealth(w http.ResponseWriter, r *http.Request) {
 	if degraded {
 		status = "degraded"
 	}
-	out := map[string]any{"status": status, "nodes": nodes}
+	out := map[string]any{
+		"status":      status,
+		"nodes":       nodes,
+		"local_cache": localCache.Stats(),
+	}
 	if storeURL != "" {
 		storeAlive := false
 		resp, err := proxyClient.Get(storeURL + "/health")
@@ -652,6 +673,9 @@ func main() {
 	port := getEnv("ROUTER_PORT", "8000")
 	storeURL = getEnv("STORE_URL", "")
 	writeThroughMode = getEnv("WRITE_THROUGH_MODE", "parallel")
+	localCacheSize, _ := strconv.Atoi(getEnv("LOCAL_CACHE_SIZE", "100"))
+	localCacheStrategy := getEnv("LOCAL_CACHE_STRATEGY", "counter")
+	localCacheRebuildInterval, _ := strconv.Atoi(getEnv("LOCAL_CACHE_REBUILD_INTERVAL", "10"))
 
 	strat := strategyRing
 	if stratEnv == "rendezvous" {
@@ -677,6 +701,24 @@ func main() {
 		circuitBreakers[nodeID] = NewCB(cbFailThreshold, cbOpenTimeout)
 	}
 
+	fetchFromL2 := func(key string) ([]byte, bool) {
+		nodes := ring.nodesForKey(key, 2)
+		for _, nodeID := range nodes {
+			res := callNode(context.Background(), nodeID, "GET",
+				nodeURLs[nodeID]+"/cache/"+key, nil, http.Header{})
+			if res.errMsg == "" && res.status == http.StatusOK {
+				return res.body, true
+			}
+		}
+		return nil, false
+	}
+	localCache = newLocalCache(
+		localCacheStrategy,
+		localCacheSize,
+		time.Duration(localCacheRebuildInterval)*time.Second,
+		fetchFromL2,
+	)
+
 	healthState = make(map[string]*nodeHealthState)
 
 	requestsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
@@ -695,6 +737,21 @@ func main() {
 		Help: "Requests rejected because the node's circuit breaker is open",
 	}, []string{"node"})
 
+	localCacheHitsTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "cache_l1_hits_total",
+		Help: "Requests served from the router's L1 local cache",
+	})
+	localCacheMissesTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "cache_l1_misses_total",
+		Help: "GET requests that missed the L1 local cache",
+	})
+	promauto.NewGaugeFunc(prometheus.GaugeOpts{
+		Name: "cache_l1_size",
+		Help: "Current number of entries in the L1 local cache",
+	}, func() float64 {
+		return float64(localCache.Stats().Size)
+	})
+
 	startHealthChecker()
 
 	mux := http.NewServeMux()
@@ -706,7 +763,7 @@ func main() {
 	mux.HandleFunc("GET /health", handleHealth)
 	mux.Handle("GET /metrics", promhttp.Handler())
 
-	log.Printf("Go router starting on :%s (nodes=%d, strategy=%s, vnodes=%d, store=%q, wt_mode=%s)",
-		port, len(nodeURLs), stratEnv, virtualNodes, storeURL, writeThroughMode)
+	log.Printf("Go router starting on :%s (nodes=%d, strategy=%s, vnodes=%d, store=%q, wt_mode=%s, l1_size=%d, l1_strategy=%s)",
+		port, len(nodeURLs), stratEnv, virtualNodes, storeURL, writeThroughMode, localCacheSize, localCacheStrategy)
 	log.Fatal(http.ListenAndServe(":"+port, mux))
 }
