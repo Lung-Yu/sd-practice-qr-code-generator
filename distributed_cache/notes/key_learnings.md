@@ -704,3 +704,79 @@ Cache 優先，但存在「store 永久遺失資料」的風險，除非有 back
 2. **模式選擇 = 失敗時你信任哪邊**：`store_first` = 信任 DB；`cache_first` = 信任 cache（適合 DB 很慢、可以最終一致的場景）。
 3. **No read-through 是一個有意識的選擇**：Read-through 讓 cache 透明（client 不感知 miss），但增加複雜度（router 需要知道 DB schema）。這個系統選擇 miss → 404，讓 client 自己決定要不要回 DB 拿。
 4. **Backfill 問題**：`cache_first` 模式下 store 掛掉恢復後，cache 裡的 key 不會自動同步回 store。需要額外的 reconciliation 機制（定期掃描 cache、CDC 等）才能解決持久性問題。
+
+---
+
+## 17. Hot Key L1 Cache：三種本地緩存策略的取捨
+
+### 問題：Router 每次讀取都產生一次 node hop
+
+Router 每次 GET 都要轉發給 cache node，產生一次網路跳躍（node hop）。當某個 key 被高頻讀取（hot key），這個 node 承受不成比例的負載，成為整個系統的瓶頸。解決方法是在 router 層維護一個小型 in-memory L1 cache，直接在 router 返回 hot key 的值，完全略過 node hop。
+
+### 三種策略比較
+
+L1 cache 透過 `LocalCache` interface 實作，有三種策略：
+
+- `counter`：counter map（所有曾見過的 key → 累計 hit 數）+ L1 cache（最多 K 個 entry）。RecordHit 時若 L1 滿了就與最弱 entry 比較，勝出才換入。`rescanMin()` 是 O(K) linear scan，在換入時執行。**重要**：被驅逐出 L1 的 key，其 counter 仍保留在 counters map，下次夠熱就能重新進入 L1。
+- `lfu`：精確 O(1) LFU，使用 freqMap（頻率 → doubly-linked list）+ minFreq 追蹤最小頻率桶。eviction 驅逐 `freqMap[minFreq]` 的 Back()（同頻率中最舊的）。只追蹤當前在 L1 的 key，不儲存歷史 counter。
+- `periodic`：RecordHit 完全無鎖（sync.Map + atomic.Uint64），後台 goroutine 每 N 秒重建 snapshot（取 top-K），對不在舊 snapshot 的 key 透過 fetchFn 從 L2 補值後原子替換。讀取路徑只需 RLock。
+
+| 策略 | 讀取 | 換入/驅逐 | L1 外的 counter | 一致性延遲 | 適合場景 |
+|------|------|-----------|-----------------|-----------|---------|
+| `counter` | O(1) RLock | O(K) rescan | 保留（counters map） | 即時 | 熱點 key 集中、key 空間有限 |
+| `lfu` | O(1) RLock | O(1) | 不保留 | 即時 | 需要精確公平驅逐 |
+| `periodic` | O(1) RLock | 異步（背景） | 保留（sync.Map） | 最多 rebuildInterval 秒 | 超高讀取吞吐、可接受短暫過期 |
+
+### 觀察到的行為差異
+
+**`counter` vs `lfu` 的差異**：
+
+```
+counter 驅逐某 key：
+  → counters map 仍有 count=50
+  → key 再次變熱（count=60）→ 立刻重入 L1
+
+lfu 驅逐某 key：
+  → freqMap 內的節點已移除，count 歸零
+  → key 再次被讀取 → count 從 1 重新累積
+  → 需要再累積到超過 minFreq 才能停留在 L1
+```
+
+**`periodic` 的特殊行為**：
+
+```
+SET key → L1 立即 Invalidate
+  → 但下次 rebuild 前，新值還不在 snapshot
+  → fetchFn 會在 rebuild 時重新從 L2 抓值補入
+
+停掉 nodes 後立即 GET：
+  key 在舊 snapshot → 200（L1 hit，不需 node）
+  key 不在舊 snapshot → 503（nodes 都掛，無法查 L2）
+
+rebuildInterval=3s，hit 50次 → 等 4s（觸發 rebuild）→ nodes 停掉 → GET → 200
+  （snapshot 已建立，L1 有值，node 掛掉不影響讀取）
+```
+
+**TTL 行為（三種策略相同）**：
+
+```
+RecordHit 時：從 node 回應的 ttl_remaining 欄位解析出 expiresAt
+Get() 時：若 time.Now().After(expiresAt) → miss + evict（清出 L1）
+  → 往 L2 查，重新 RecordHit，更新 expiresAt
+
+TTL=2s，hit 50次，等 3s：
+  → L1 miss（已過期）
+  → GET 轉發到 node（L2 hit 或 miss）
+  → RecordHit 重新計入，expiresAt 更新
+```
+
+### 帶走的原則
+
+1. **L1 是純讀取最佳化，不影響寫入語意**：SET/DELETE 呼叫 `Invalidate()` 保持正確性；L1 只加速讀取，不參與寫入路徑。這讓它可以完全透明地疊加在任何現有 cache 架構上。
+2. **counter 的 counters map 故意不清除**：被驅逐出 L1 的 key，其歷史頻率保留在 counters map。這讓曾經是 hot key、暫時冷卻的 key，再次變熱時能比全新 key 更快重入 L1。代價是 counters map 隨不重複 key 數量線性成長——key 空間有限才安全。
+3. **O(1) 不一定比 O(K) 快**：lfu 的 O(1) 在 K=100 時比 counter 的 O(K) rescan 優勢不明顯；但在 K=10000 時差距顯著。選擇策略要考慮實際 capacity。
+4. **periodic 用異步換無鎖**：RecordHit 路徑零競爭（atomic add），讀取路徑只有一個 RLock，代價是 L1 最多落後 rebuildInterval 秒。適合讀多寫少、可容忍短暫過期的場景。
+5. **fetchFn 依賴注入讓策略可測試**：periodicCache 需要從 L2 補值，但不能直接呼叫 main.go 的 callNode。把 fetchFn 作為參數注入，讓 local_cache_test.go 可以用 fake fetchFn 測試整個 rebuild 邏輯，而不需要真實的 cache nodes。
+6. **多 router 下 L1 需要 pub/sub 失效**：單 router 時 `Invalidate()` 即時清除本地 L1；多 router 部署時，A router 的 SET 無法通知 B router 的 L1，需要 Redis pub/sub 或類似機制廣播失效事件。這個系統目前只支援單 router。
+
+---
