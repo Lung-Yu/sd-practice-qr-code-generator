@@ -18,6 +18,9 @@ services:
       ROUTER_PORT: "8000"
       STORE_URL: "http://dc-store:8004"
       WRITE_THROUGH_MODE: "${WRITE_THROUGH_MODE:-parallel}"
+      LOCAL_CACHE_SIZE: "100"
+      LOCAL_CACHE_STRATEGY: "${LOCAL_CACHE_STRATEGY:-counter}"
+      LOCAL_CACHE_REBUILD_INTERVAL: "${LOCAL_CACHE_REBUILD_INTERVAL:-10}"
 
   dc-node1:
     build:
